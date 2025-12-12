@@ -4,6 +4,8 @@
 // @version      9.7
 // @description  Orders vs comments separated, ignore empty responses, persistent offline/online banners in English
 // @match        https://nodered.ceonline.eu:1880/*
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/Stable%20Data%20Layer%20v9.7.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/Stable%20Data%20Layer%20v9.7.js
 // @grant        none
 // ==/UserScript==
 
