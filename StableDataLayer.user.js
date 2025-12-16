@@ -8,8 +8,8 @@
 // @match        https://nodered.ceonline.eu:1880/cerepair-dashboard/index.html?report=Werkvoorbereiding
 // @match        https://nodered.ceonline.eu:1880/cerepair-dashboard/index.html?report=Vision%20Assistentie
 // @match        https://nodered.ceonline.eu:1880/cerepair-dashboard/index.html?report=Audio%20Assistentie
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/Stable%20Data%20Layer%20v9.7.js
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/Stable%20Data%20Layer%20v9.7.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/StableDataLayer.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/StableDataLayer.user.js
 // @grant        none
 // ==/UserScript==
 
