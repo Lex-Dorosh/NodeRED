@@ -7,8 +7,7 @@
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-end
 // @grant        none
-//
-// !!! Replace with your real GitHub RAW URLs:
+
 // @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/gxo-pur-helper.user.js
 // @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/gxo-pur-helper.user.js
 // ==/UserScript==
