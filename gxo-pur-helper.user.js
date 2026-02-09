@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status)
 // @namespace    https://groupwise.cerepair.nl/
-// @version      4.11
-// @description  GG PUR helper: Samsung gets AUTO 42,50 full flow (Financials+Bereken+Claim VOID1+Mail direct+SMS+Status). Other brands: Fill-only buttons. Frame-safe Claim tab detection, order-scoped flow state + stale auto-clean, reset button + hotkey, no06 handling.
+// @version      4.13
+// @description  GG PUR helper: Samsung gets AUTO 42,50 & AUTO 63,80 full flow (Financials+Bereken+Claim VOID1+Mail direct+SMS+Status). Other brands: Fill-only buttons incl. Fill 100,50. Language detection -> SMS template by owner language.
 // @author       you
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-end
 // @grant        none
-
+//
 // @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/gxo-pur-helper.user.js
 // @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/gxo-pur-helper.user.js
 // ==/UserScript==
@@ -70,6 +70,13 @@
 
   const NO06_PHRASE = 'mobiel nummer is niet valide';
 
+  // SMS template selection by language (order language from Repair tab)
+  const SMS_TEMPLATES_BY_LANG = {
+    EN: ['response email', 'response e-mail'],
+    NL: ['melding reactie op email', 'reactie op email'],
+    FR: ['réponse email', 'reponse email', 'réponse e-mail', 'reponse e-mail']
+  };
+
   // =========================
   // LOG
   // =========================
@@ -126,23 +133,6 @@
     } catch { return null; }
   }
 
-  function getOrderNumberFromLegend() {
-    const legends = document.querySelectorAll('legend.cec-legend-strong');
-    for (const lg of legends) {
-      const text = (lg.textContent || '').trim();
-      const firstToken = text.split(/\s+/)[0];
-      if (/^\d+$/.test(firstToken)) return firstToken;
-    }
-    return null;
-  }
-
-  function getOrderNumber() {
-    const nr = getOrderNumberFromLegend() || getOrderIdFromUrl();
-    if (!nr) log('Could not find order number, using XXX');
-    else log('Order number:', nr);
-    return nr;
-  }
-
   function getAllDocsCrossFrames() {
     const docs = [];
     const add = (d) => { if (d && !docs.includes(d)) docs.push(d); };
@@ -169,6 +159,45 @@
       } catch {}
     }
     return null;
+  }
+
+  function getOrderNumberFromLegend() {
+    const legends = document.querySelectorAll('legend.cec-legend-strong');
+    for (const lg of legends) {
+      const text = (lg.textContent || '').trim();
+      const firstToken = text.split(/\s+/)[0];
+      if (/^\d+$/.test(firstToken)) return firstToken;
+    }
+    return null;
+  }
+
+  // ✅ NEW: Read order number from <h3>reparatie 3302973 GG Samsung</h3> (also h1/h2), cross-frames.
+  function getOrderNumberFromHeading() {
+    for (const d of getAllDocsCrossFrames()) {
+      try {
+        const hs = Array.from(d.querySelectorAll('h1,h2,h3'));
+        for (const h of hs) {
+          const t = String(h.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!t) continue;
+
+          // Main pattern: "reparatie 3302973 ..."
+          const m = t.match(/reparatie\s+(\d+)/i);
+          if (m && m[1]) return m[1];
+
+          // Fallback: any standalone long number in heading
+          const m2 = t.match(/\b(\d{6,})\b/);
+          if (m2 && m2[1]) return m2[1];
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  function getOrderNumber() {
+    const nr = getOrderNumberFromHeading() || getOrderNumberFromLegend() || getOrderIdFromUrl();
+    if (!nr) log('Could not find order number, using XXX');
+    else log('Order number:', nr);
+    return nr;
   }
 
   function hasClaimTabCrossFrames() {
@@ -210,16 +239,18 @@
   function ensureFlowState() {
     let st = readFlowStateRaw();
     if (!st || typeof st !== 'object') {
-      st = { orderId: null, step: 'idle', autoMail: '0', autoSms: '0', ts: Date.now() };
+      st = { orderId: null, step: 'idle', autoMail: '0', autoSms: '0', ownerLang: '', ts: Date.now() };
     }
     if (!st.step) st.step = 'idle';
     if (st.autoMail !== '1') st.autoMail = '0';
     if (st.autoSms !== '1') st.autoSms = '0';
+    if (!st.ownerLang) st.ownerLang = '';
     if (!st.ts) st.ts = Date.now();
     return st;
   }
 
   function getFlowStep() { return ensureFlowState().step || 'idle'; }
+
   function setFlowStep(step) {
     const st = ensureFlowState();
     st.step = step;
@@ -245,6 +276,18 @@
     st.ts = Date.now();
     writeFlowState(st);
     log('Auto-sms flag ->', on);
+  }
+
+  function setOwnerLang(code) {
+    const st = ensureFlowState();
+    const c = String(code || '').trim().toUpperCase();
+    if (!c) return;
+    if (st.ownerLang === c) return;
+    st.ownerLang = c;
+    st.orderId = getOrderIdFromUrl() || st.orderId || null;
+    st.ts = Date.now();
+    writeFlowState(st);
+    log('Owner language ->', c);
   }
 
   function resetAllState() {
@@ -349,6 +392,26 @@
     return null;
   }
 
+  // Read owner language from Repair tab select: #lst_Language
+  function initOwnerLanguageWatcher() {
+    const sel = findByIdCrossFrames('lst_Language');
+    if (!sel) return;
+
+    const update = () => {
+      const val = String(sel.value || '').trim().toUpperCase();
+      if (val) setOwnerLang(val);
+    };
+
+    update();
+
+    try {
+      if (!sel.dataset.purLangWatch) {
+        sel.dataset.purLangWatch = '1';
+        sel.addEventListener('change', update, true);
+      }
+    } catch {}
+  }
+
   function ensureWorkdescriptionClearedOrConfirmed() {
     const wd = findByIdCrossFrames('workdescription');
     if (!wd) { log('Workdescription not found'); return true; }
@@ -416,6 +479,7 @@
     );
   }
 
+  // ✅ Uses order number from heading now via getOrderNumber()
   function buildPur63Text(orderNr) {
     const nr = orderNr || 'XXX';
     return (
@@ -429,6 +493,12 @@
   }
 
   function setWorkdescriptionPur(type) {
+    // Preset 100 is Financials-only; do not touch Workdescription.
+    if (type === 100) {
+      log('Preset 100: Workdescription unchanged');
+      return true;
+    }
+
     const wd = findByIdCrossFrames('workdescription');
     if (!wd) { log('Workdescription not found'); return false; }
 
@@ -450,8 +520,14 @@
       return;
     }
 
-    const targetBasic   = '35,12';
-    const targetFreight = (type === 42) ? '0,00' : '17,61';
+    const targetBasic =
+      (type === 100) ? '47,94' : '35,12';
+
+    const targetFreight =
+      (type === 42)  ? '0,00'  :
+      (type === 63)  ? '17,61' :
+      (type === 100) ? '35,12' :
+      '0,00';
 
     if (freight) setValueRich(freight, targetFreight, 'freightcost');
     else log('freightcost not found (continue)');
@@ -796,8 +872,9 @@
   }
 
   function openerPatchFlow(patch) {
-    const st = openerGetFlowState() || { orderId: null, step: 'idle', autoMail: '0', autoSms: '0', ts: Date.now() };
+    const st = openerGetFlowState() || { orderId: null, step: 'idle', autoMail: '0', autoSms: '0', ownerLang: '', ts: Date.now() };
     Object.assign(st, patch || {});
+    if (!st.ownerLang) st.ownerLang = '';
     st.ts = Date.now();
     openerSetFlowState(st);
   }
@@ -864,12 +941,28 @@
   function popMark(stage) { popSet(SMS_POP_STAGE_KEY, stage); popSet(SMS_POP_TS_KEY, String(Date.now())); }
   function popIncTry() { const t = popTries() + 1; popSet(SMS_POP_TRIES_KEY, String(t)); return t; }
 
+  function findSmsTemplateOption(sel, langCode) {
+    const lang = String(langCode || '').trim().toUpperCase() || 'NL';
+    const opts = Array.from(sel.options || []);
+
+    const keywords = SMS_TEMPLATES_BY_LANG[lang] || SMS_TEMPLATES_BY_LANG.NL || [];
+    for (const kw of keywords) {
+      const hit = opts.find(o => norm(o.text).includes(norm(kw)));
+      if (hit) return hit;
+    }
+
+    // fallback: any option containing "email"
+    const anyEmail = opts.find(o => norm(o.text).includes('email'));
+    return anyEmail || null;
+  }
+
   function initSmsPopup() {
     if (!window.opener) return;
 
     const openerFlow = openerGetFlowState();
     const autoSms = openerFlow && openerFlow.autoSms;
     const flowStep = openerFlow && openerFlow.step;
+    const ownerLang = (openerFlow && openerFlow.ownerLang) ? String(openerFlow.ownerLang).trim().toUpperCase() : 'NL';
 
     if (autoSms !== '1' || flowStep !== 'afterSms') return;
 
@@ -915,7 +1008,7 @@
       return;
     }
 
-    const opt = Array.from(sel.options).find(o => norm(o.text).includes('melding reactie op email'));
+    const opt = findSmsTemplateOption(sel, ownerLang);
     if (!opt) { popMark('waitingManual'); return; }
 
     if (sel.value !== opt.value) {
@@ -1011,6 +1104,15 @@
       startPreset(63, 'fill');
     });
 
+    const btnFill100 = document.createElement('button');
+    btnFill100.textContent = 'Fill 100,50';
+    styleBtn(btnFill100);
+    btnFill100.title = 'Vult alleen Financials (Vracht 35,12 + Behandelingskosten 47,94) en klikt Bereken. Workdescription blijft ongewijzigd.';
+    btnFill100.addEventListener('click', () => {
+      // Intentionally no Workdescription confirm/clear here
+      startPreset(100, 'fill');
+    });
+
     if (isSamsung && claimTabOk) {
       const btnAuto42 = document.createElement('button');
       btnAuto42.textContent = 'AUTO 42,50';
@@ -1022,13 +1124,27 @@
         startPreset(42, 'auto');
       });
 
+      // ✅ NEW: AUTO 63,80
+      const btnAuto63 = document.createElement('button');
+      btnAuto63.textContent = 'AUTO 63,80';
+      styleBtn(btnAuto63);
+      btnAuto63.title =
+        'Volledige flow (Samsung): Financials (17,61 + 35,12)+Workdescription 63,80, Garantie->GG, Bereken, Claim=VOID1+Opslaan, Mail direct, SMS (bij Geen 06: blog "Geen 06"), status Wait for customer.';
+      btnAuto63.addEventListener('click', () => {
+        if (!ensureWorkdescriptionClearedOrConfirmed()) return;
+        startPreset(63, 'auto');
+      });
+
       container.appendChild(btnAuto42);
+      container.appendChild(btnAuto63);
       container.appendChild(btnFill42);
       container.appendChild(btnFill63);
+      container.appendChild(btnFill100);
       container.appendChild(btnReset);
     } else {
       container.appendChild(btnFill42);
       container.appendChild(btnFill63);
+      container.appendChild(btnFill100);
       container.appendChild(btnReset);
     }
 
@@ -1040,6 +1156,9 @@
     installResetHotkey();
     installOpenerContinueHooks();
     sanitizeFlowForCurrentOrder();
+
+    // capture language ASAP (Repair tab select #lst_Language)
+    initOwnerLanguageWatcher();
 
     setTimeout(() => {
       initRepairPurButtons();
