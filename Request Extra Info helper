@@ -1,0 +1,1975 @@
+// ==UserScript==
+// @name         Request Extra Info helper (mail template + dynamic bullet list)
+// @namespace    http://tampermonkey.net/
+// @version      3.6.0
+// @description  Request Extra Info: robust mail+sms automation (NL+EN). Fuzzy mail template select, multi-language bullet injection, SMS quicktext fuzzy (NL+EN), optional auto-switch customer language to NL, safe gating to avoid hijacking manual popups, auto-send, auto-close, NO06 handling -> status -> blog "Geen 06". Robust boot loop for slow DOM.
+// @author       You
+// @match        https://groupwise.cerepair.nl/*
+// @run-at       document-end
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // =========================
+  // GLOBALS (NO TDZ)
+  // =========================
+  var DEBUG = true;
+  var LOG_PREFIX = '[ReqInfo]';
+
+  var repairWatcherStarted = false;
+  var currentCustomerName = null;
+  var currentCustomerLanguage = null; // NL/EN/FR/...
+
+  // localStorage keys
+  var STORAGE_KEY = 'ReqInfoSelections';   // per caseId { items:[...] }
+  var FLOW_KEY    = 'ReqInfoFlow_v3';      // flow state
+  var UI_PREF_KEY = 'ReqInfoUIPrefs_v2';   // ui prefs
+
+  // Timing / safety
+  var FLOW_TTL_MS = 10 * 60 * 1000;
+
+  // Prevent hijacking manual popups:
+  // Automation runs ONLY if popup was opened recently by this flow AND armed flags are set.
+  var POPUP_FRESH_MS = 75 * 1000; // 75 seconds (tighter to avoid "manual later" hijack)
+
+  // Step-by-step requirement: SMS send only after mail sent AND mail window actually closed
+  var SMS_REQUIRE_MAIL_DONE_AND_CLOSED = true;
+
+  // Optional: offer to switch customer language to NL (stable templates)
+  var OFFER_SWITCH_LANG_TO_NL = true;
+
+  // Mail templates (NL+EN) - fuzzy match
+  var MAIL_TEMPLATE_REGEXES = [
+    /aanvraag extra informatie buitendienst/i,
+    /extra informatie.*buitendienst/i,
+    /aanvraag.*extra informatie/i,
+    /request.*extra information/i,
+    /extra information.*field/i,
+    /request.*additional information/i
+  ];
+  var MAIL_TEMPLATE_KEYWORDS = [
+    'extra', 'informatie', 'information', 'aanvraag', 'request', 'buitendienst', 'field', 'additional'
+  ];
+
+  var MAIL_WATCH_MAX_MS = 60000;
+
+  // SMS (old exact label kept as "preferred", but selection is fuzzy now)
+  var SMS_TEXT_LABEL = 'Melding reactie op Email';
+
+  var SMS_TEMPLATE_MIN_SCORE = 10;
+  var SMS_TEMPLATE_EXACT = [
+    'Melding reactie op Email',
+    'Melding reactie op E-mail'
+  ];
+  var SMS_TEMPLATE_KEYWORDS = [
+    // NL
+    'melding', 'reactie', 'e-mail', 'email',
+    // EN
+    'notification', 'message', 'reply', 'response', 'reaction', 'email'
+  ];
+  var SMS_TEMPLATE_AVOID = [
+    'monteur', 'technician', 'afspraak', 'appointment', 'bezorg', 'delivery', 'tracking', 'onderdeel', 'part'
+  ];
+
+  // SMS robustness: wait for body after selecting template
+  var SMS_BODY_MIN_LEN = 2;          // do not send if body shorter than this
+  var SMS_AFTER_SELECT_MIN_MS = 900; // minimum wait after selecting template
+  var SMS_BODY_WAIT_MAX_MS = 12000;  // max wait for body to appear
+  var SMS_CHANGE_RETRY_MS = 1200;    // retry triggerChange interval
+  var SMS_CHANGE_MAX_RETRIES = 3;
+
+  // Final status step
+  var STATUS_WATCH_MAX_MS = 15000;
+  var STATUS_ASSIST_VALUE = '55'; // Extra informatie opgevraagd
+
+  // NO06 handling
+  var NO06_PHRASE = 'mobiel nummer is niet valide';
+  var NO06_BLOG_TEXT = 'Geen 06';
+
+  // Signature to avoid double-injecting bullet list in mail body
+  var MAIL_UL_SIGNATURE = 'reqinfo_dynamic_list_v1';
+
+  // =========================
+  // LOG + HELPERS
+  // =========================
+  function log() {
+    if (!DEBUG) return;
+    try { console.log.apply(console, [LOG_PREFIX].concat([].slice.call(arguments))); } catch {}
+  }
+
+  function norm(s) { return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
+  function now() { return Date.now(); }
+
+  function safeInit(fn) {
+    try {
+      if (document.readyState === 'complete' || document.readyState === 'interactive') fn();
+      else document.addEventListener('DOMContentLoaded', fn, { once: true });
+    } catch (e) {
+      log('Error in init:', e);
+    }
+  }
+
+  function safeGetLS(k) { try { return localStorage.getItem(k); } catch { return null; } }
+  function safeSetLS(k, v) { try { localStorage.setItem(k, v); return true; } catch { return false; } }
+  function safeDelLS(k) { try { localStorage.removeItem(k); } catch {} }
+
+  function randToken() {
+    try { return Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6); }
+    catch { return String(Date.now()); }
+  }
+
+  function loadSelections() {
+    try {
+      var raw = safeGetLS(STORAGE_KEY);
+      if (!raw) return {};
+      return JSON.parse(raw);
+    } catch (e) {
+      log('Error parsing selections from localStorage:', e);
+      return {};
+    }
+  }
+
+  function saveSelections(map) {
+    try { safeSetLS(STORAGE_KEY, JSON.stringify(map)); }
+    catch (e) { log('Error saving selections to localStorage:', e); }
+  }
+
+  function getFlow() {
+    try {
+      var raw = safeGetLS(FLOW_KEY);
+      if (!raw) return null;
+      var obj = JSON.parse(raw);
+      if (!obj || typeof obj !== 'object') return null;
+
+      var age = now() - (Number(obj.ts) || 0);
+      if (age > FLOW_TTL_MS) {
+        safeDelLS(FLOW_KEY);
+        return null;
+      }
+      return obj;
+    } catch {
+      return null;
+    }
+  }
+
+  function setFlow(patch, replaceAll) {
+    try {
+      var base = replaceAll ? {} : (getFlow() || {});
+      var next = Object.assign(base, patch || {});
+      next.ts = now();
+      safeSetLS(FLOW_KEY, JSON.stringify(next));
+      return next;
+    } catch {
+      return null;
+    }
+  }
+
+  function clearFlow(reason) {
+    safeDelLS(FLOW_KEY);
+    log('Flow cleared.', reason ? ('reason=' + reason) : '');
+  }
+
+  function isVisible(el) { return el && el.offsetParent !== null; }
+
+  function isNodeVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try {
+      if (el.offsetParent !== null) return true;
+      var cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+      if (!cs) return false;
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+    } catch { return false; }
+  }
+
+  function findButtonByTextRegex(regex) {
+    var btns = Array.from(document.querySelectorAll(
+      'button, input[type="button"], input[type="submit"], input.button, button.button'
+    ));
+    return btns.find(function (b) {
+      var t = norm(b.textContent || '');
+      var v = norm(b.value || '');
+      return regex.test(t) || regex.test(v);
+    }) || null;
+  }
+
+  function triggerChange(el) {
+    if (!el) return;
+    try {
+      if (typeof el.onchange === 'function') el.onchange();
+      else el.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch {
+      try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+    }
+  }
+
+  function detectCustomerNameFromLegend() {
+    var leg = document.querySelector('fieldset legend.cec-legend-strong');
+    if (!leg) return null;
+
+    var a = leg.querySelector('a');
+    if (a && a.textContent && a.textContent.trim()) return a.textContent.trim();
+
+    var txt = leg.textContent || '';
+    var cleaned = txt.replace(/\s+/g, ' ').trim();
+    var parts = cleaned.split(' ');
+    if (parts.length > 1) return parts.slice(1).join(' ').trim();
+    return cleaned || null;
+  }
+
+  function detectCustomerLanguageOnRepairPage() {
+    // common: <select id="lst_Language"> in customer information block
+    try {
+      var sel = document.getElementById('lst_Language');
+      if (sel && sel.value) return String(sel.value).trim().toUpperCase() || null;
+    } catch {}
+    return null;
+  }
+
+  // =========================
+  // Stable invoke (avoid flaky .click)
+  // =========================
+  function runOnclickCode(btn, label) {
+    if (!btn) return false;
+
+    try {
+      if (typeof btn.onclick === 'function') {
+        btn.onclick.call(btn);
+        log(label + ': invoked btn.onclick()');
+        return true;
+      }
+    } catch (e1) { log(label + ': btn.onclick() failed', e1); }
+
+    try {
+      var oc = btn.getAttribute && btn.getAttribute('onclick');
+      if (oc && String(oc).trim()) {
+        var code = String(oc).replace(/^\s*javascript:\s*/i, '');
+        code = code.replace(/^\s*return\s+/i, '');
+        code = code.replace(/;\s*return\s+false\s*;?\s*$/i, ';');
+        code = code.replace(/\breturn\s+false\s*;?/ig, '');
+        code = code.replace(/\breturn\s+([^\n;]+)\s*;?/ig, '$1;');
+
+        (new Function(code)).call(btn);
+        log(label + ': executed onclick attribute');
+        return true;
+      }
+    } catch (e2) { log(label + ': onclick attribute failed', e2); }
+
+    try {
+      btn.click();
+      log(label + ': fallback btn.click()');
+      return true;
+    } catch (e3) { log(label + ': fallback click failed', e3); }
+
+    return false;
+  }
+
+  // =========================
+  // SAFETY GATE: never hijack manual popups
+  // =========================
+  function gateOk(flow, kind) {
+    if (!flow || flow.origin !== 'reqinfo' || !flow.token) return false;
+
+    // Must be explicitly armed per popup-kind
+    if (kind === 'mail' && flow.mailArmed !== true) return false;
+    if (kind === 'sms'  && flow.smsArmed  !== true) return false;
+
+    var t = 0;
+    if (kind === 'mail') t = Number(flow.mailOpenedAt || 0);
+    if (kind === 'sms')  t = Number(flow.smsOpenedAt || 0);
+    if (!t) return false;
+
+    if (now() - t > POPUP_FRESH_MS) return false;
+
+    if (kind === 'mail' && flow.mailRequested !== true) return false;
+    if (kind === 'sms'  && flow.smsRequested  !== true) return false;
+
+    // Also: don't re-run automation when already completed/skipped
+    if (kind === 'mail' && flow.mailDone === true && flow.mailClosed === true) return false;
+    if (kind === 'sms'  && (flow.smsDone === true || flow.smsSkipped === true || flow.smsNo06 === true)) return false;
+
+    return true;
+  }
+
+  // =========================
+  // UI PREFS (kept)
+  // =========================
+  function uiLoadPrefs() {
+    try {
+      var raw = safeGetLS(UI_PREF_KEY);
+      var obj = JSON.parse(raw || '{}');
+      return {
+        pillMaxW: Number(obj.pillMaxW || 175),
+        fontSize: Number(obj.fontSize || 9),
+        colors: (obj.colors && typeof obj.colors === 'object') ? obj.colors : {}
+      };
+    } catch {
+      return { pillMaxW: 175, fontSize: 9, colors: {} };
+    }
+  }
+
+  function uiSavePrefs(p) {
+    return safeSetLS(UI_PREF_KEY, JSON.stringify({
+      pillMaxW: Number(p.pillMaxW || 175),
+      fontSize: Number(p.fontSize || 9),
+      colors: p.colors || {}
+    }));
+  }
+
+  function uiResetPrefs() { safeDelLS(UI_PREF_KEY); }
+
+  function downloadJSON(filename, obj) {
+    try {
+      var blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () {
+        try { URL.revokeObjectURL(a.href); } catch {}
+        try { a.remove(); } catch {}
+      }, 150);
+    } catch (e) {
+      alert('Export failed: ' + (e && e.message ? e.message : String(e)));
+    }
+  }
+
+  function uiHexToRgb(hex) {
+    var m = String(hex || '').trim().match(/^#?([0-9a-f]{6})$/i);
+    if (!m) return null;
+    var v = parseInt(m[1], 16);
+    return { r: (v >> 16) & 255, g: (v >> 8) & 255, b: v & 255 };
+  }
+
+  function uiPickTextColor(bgHex) {
+    var rgb = uiHexToRgb(bgHex);
+    if (!rgb) return '#111827';
+    var yiq = (rgb.r * 299 + rgb.g * 587 + rgb.b * 114) / 1000;
+    return yiq >= 160 ? '#111827' : '#ffffff';
+  }
+
+  function uiApplyPillColor(pillEl, hexOrNull) {
+    if (!pillEl) return;
+    if (!hexOrNull) {
+      pillEl.style.removeProperty('--ri-bg');
+      pillEl.style.removeProperty('--ri-bd');
+      pillEl.style.removeProperty('--ri-txt');
+      pillEl.style.removeProperty('--ri-accent');
+      return;
+    }
+    var txt = uiPickTextColor(hexOrNull);
+    pillEl.style.setProperty('--ri-bg', hexOrNull);
+    pillEl.style.setProperty('--ri-bd', hexOrNull);
+    pillEl.style.setProperty('--ri-txt', txt);
+    pillEl.style.setProperty('--ri-accent', hexOrNull);
+  }
+
+  function uiApplySizing(panelEl) {
+    if (!panelEl) return;
+    var p = uiLoadPrefs();
+    var wpx = String(Number(p.pillMaxW || 175)) + 'px';
+    var fpx = String(Number(p.fontSize || 9)) + 'px';
+    panelEl.style.setProperty('--ri-pill-w', wpx);
+    panelEl.style.setProperty('--ri-fontsize', fpx);
+
+    try {
+      panelEl.querySelectorAll('.reqinfo-pill[data-reqinfo-key]').forEach(function (pill) {
+        pill.style.width = wpx;
+        pill.style.maxWidth = wpx;
+        pill.style.flexBasis = wpx;
+      });
+    } catch {}
+  }
+
+  function uiInjectCssOnce() {
+    var STYLE_ID = 'reqinfo-ui-style-v3';
+    if (document.getElementById(STYLE_ID)) return;
+
+    var css = `
+      .reqinfo-panel{
+        border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;
+        padding:10px 10px 8px 10px;margin:8px 0 0 0;box-shadow:0 1px 0 rgba(17,24,39,.04);
+        --ri-pill-w: 175px; --ri-fontsize: 9px;
+      }
+      .reqinfo-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;}
+      .reqinfo-title{font-weight:900;font-size:12px;color:#0f172a;display:flex;align-items:center;gap:8px;user-select:none;}
+      .reqinfo-sub{font-weight:700;font-size:11px;color:#64748b;}
+      .reqinfo-iconbtn{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:12px;
+        border:1px solid #d0d5dd;background:#f8fafc;cursor:pointer;user-select:none;font-size:16px;padding:0;}
+      .reqinfo-iconbtn:hover{filter:brightness(0.98);} .reqinfo-iconbtn:active{transform:translateY(1px);}
+      .reqinfo-settings{display:none;margin:8px 0 10px 0;padding:8px;border:1px dashed #cbd5e1;border-radius:12px;background:#ffffff;}
+      .reqinfo-panel.reqinfo-config .reqinfo-settings{display:block;}
+      .reqinfo-cfgbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+      .reqinfo-cfggrp{display:flex;align-items:center;gap:6px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:12px;background:#f8fafc;}
+      .reqinfo-cfggrp label{font-size:11px;font-weight:900;color:#0f172a;white-space:nowrap;}
+      .reqinfo-cfggrp input[type="range"]{width:140px;}
+      .reqinfo-iconmini{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:12px;
+        border:1px solid #d0d5dd;background:#ffffff;cursor:pointer;user-select:none;font-size:14px;padding:0;}
+      .reqinfo-iconmini:hover{filter:brightness(0.98);}
+      .reqinfo-file{display:none;}
+      .reqinfo-legend{font-size:11px;color:#475569;white-space:nowrap;}
+      .reqinfo-items{display:flex;flex-wrap:wrap;gap:6px;align-items:flex-start;}
+      .reqinfo-pill{
+        display:flex;align-items:flex-start;gap:6px;padding:4px 8px;border-radius:12px;
+        border:1px solid var(--ri-bd, #cbd5e1);background:var(--ri-bg, #ffffff);color:var(--ri-txt, #111827);
+        cursor:pointer;box-sizing:border-box;user-select:none;
+        width:var(--ri-pill-w);max-width:var(--ri-pill-w);flex:0 0 var(--ri-pill-w);
+      }
+      .reqinfo-pill input[type="checkbox"]{margin:0;margin-top:2px;flex:0 0 auto;accent-color:var(--ri-accent, auto);}
+      .reqinfo-pill .reqinfo-label{
+        min-width:0;flex:1 1 auto;font-size:var(--ri-fontsize);line-height:1.12;overflow:hidden;
+        display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow-wrap:anywhere;word-break:break-word;hyphens:auto;
+      }
+      .reqinfo-tools{display:none;gap:4px;margin-left:2px;flex:0 0 auto;align-items:flex-start;}
+      .reqinfo-panel.reqinfo-config .reqinfo-tools{display:flex;}
+      .reqinfo-mini{width:22px;height:22px;border-radius:10px;border:1px solid #d0d5dd;background:#ffffff;cursor:pointer;padding:0;
+        display:inline-flex;align-items:center;justify-content:center;font-size:12px;user-select:none;}
+      .reqinfo-mini:hover{filter:brightness(0.98);}
+      .reqinfo-colorin{display:none;}
+      .reqinfo-actions{margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+      .reqinfo-hint{font-size:10px;font-weight:700;color:#64748b;user-select:none;}
+    `;
+
+    var st = document.createElement('style');
+    st.id = STYLE_ID;
+    st.textContent = css;
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  function uiAttachPanelHeader(panelEl) {
+    uiInjectCssOnce();
+    if (!panelEl) return;
+
+    panelEl.classList.add('reqinfo-panel');
+
+    var prefs = uiLoadPrefs();
+
+    var header = document.createElement('div');
+    header.className = 'reqinfo-header';
+
+    var titleBox = document.createElement('div');
+    titleBox.className = 'reqinfo-title';
+    titleBox.textContent = 'Request extra info';
+
+    var sub = document.createElement('span');
+    sub.className = 'reqinfo-sub';
+    sub.textContent = 'Instellingen';
+    titleBox.appendChild(sub);
+
+    var gear = document.createElement('button');
+    gear.type = 'button';
+    gear.className = 'reqinfo-iconbtn';
+    gear.textContent = '⚙';
+    gear.title = 'Instellingen';
+    gear.addEventListener('click', function (ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      panelEl.classList.toggle('reqinfo-config');
+    }, true);
+
+    header.appendChild(titleBox);
+    header.appendChild(gear);
+
+    var settings = document.createElement('div');
+    settings.className = 'reqinfo-settings';
+
+    var bar = document.createElement('div');
+    bar.className = 'reqinfo-cfgbar';
+
+    var grpW = document.createElement('div');
+    grpW.className = 'reqinfo-cfggrp';
+    var lblW = document.createElement('label'); lblW.textContent = 'Breedte';
+    var rngW = document.createElement('input');
+    rngW.type = 'range'; rngW.min = '120'; rngW.max = '260'; rngW.step = '5'; rngW.value = String(prefs.pillMaxW);
+    rngW.addEventListener('input', function () {
+      var p = uiLoadPrefs();
+      p.pillMaxW = Number(rngW.value || 175);
+      uiSavePrefs(p);
+      uiApplySizing(panelEl);
+    }, true);
+    grpW.appendChild(lblW); grpW.appendChild(rngW);
+
+    var grpF = document.createElement('div');
+    grpF.className = 'reqinfo-cfggrp';
+    var lblF = document.createElement('label'); lblF.textContent = 'Tekst';
+    var rngF = document.createElement('input');
+    rngF.type = 'range'; rngF.min = '8'; rngF.max = '12'; rngF.step = '1'; rngF.value = String(prefs.fontSize);
+    rngF.addEventListener('input', function () {
+      var p2 = uiLoadPrefs();
+      p2.fontSize = Number(rngF.value || 9);
+      uiSavePrefs(p2);
+      uiApplySizing(panelEl);
+    }, true);
+    grpF.appendChild(lblF); grpF.appendChild(rngF);
+
+    var btnExport = document.createElement('button');
+    btnExport.type = 'button'; btnExport.className = 'reqinfo-iconmini';
+    btnExport.textContent = '⭳'; btnExport.title = 'Export instellingen';
+    btnExport.addEventListener('click', function () {
+      downloadJSON('reqinfo-ui-settings.json', {
+        kind: 'Request-Extra-Info-UI',
+        version: '3.6.0',
+        exportedAt: new Date().toISOString(),
+        uiPrefs: uiLoadPrefs()
+      });
+    }, true);
+
+    var lblImport = document.createElement('label');
+    lblImport.className = 'reqinfo-iconmini';
+    lblImport.title = 'Import instellingen';
+    lblImport.textContent = '⭱';
+
+    var fileIn = document.createElement('input');
+    fileIn.type = 'file'; fileIn.className = 'reqinfo-file'; fileIn.accept = 'application/json';
+    lblImport.appendChild(fileIn);
+
+    fileIn.addEventListener('change', function (ev) {
+      var f = ev.target.files && ev.target.files[0];
+      if (!f) return;
+
+      var reader = new FileReader();
+      reader.onload = function () {
+        try {
+          var incoming = JSON.parse(String(reader.result || '{}'));
+          var p = incoming && incoming.uiPrefs ? incoming.uiPrefs : incoming;
+          if (!p || typeof p !== 'object') throw new Error('Invalid JSON');
+
+          var next = uiLoadPrefs();
+          if (typeof p.pillMaxW === 'number') next.pillMaxW = p.pillMaxW;
+          if (typeof p.fontSize === 'number') next.fontSize = p.fontSize;
+          if (p.colors && typeof p.colors === 'object') next.colors = p.colors;
+
+          uiSavePrefs(next);
+
+          rngW.value = String(next.pillMaxW);
+          rngF.value = String(next.fontSize);
+
+          panelEl.querySelectorAll('.reqinfo-pill[data-reqinfo-key]').forEach(function (pill) {
+            var k = pill.getAttribute('data-reqinfo-key');
+            var c = next.colors && next.colors[k] ? String(next.colors[k]) : '';
+            uiApplyPillColor(pill, c || null);
+          });
+
+          uiApplySizing(panelEl);
+          alert('Import done.');
+        } catch (e) {
+          alert('Import failed: ' + (e && e.message ? e.message : String(e)));
+        } finally {
+          ev.target.value = '';
+        }
+      };
+      reader.readAsText(f);
+    }, true);
+
+    var btnReset = document.createElement('button');
+    btnReset.type = 'button'; btnReset.className = 'reqinfo-iconmini';
+    btnReset.textContent = '↺'; btnReset.title = 'Reset instellingen';
+    btnReset.addEventListener('click', function () {
+      uiResetPrefs();
+      var def = uiLoadPrefs();
+      rngW.value = String(def.pillMaxW);
+      rngF.value = String(def.fontSize);
+      panelEl.querySelectorAll('.reqinfo-pill[data-reqinfo-key]').forEach(function (pill) {
+        uiApplyPillColor(pill, null);
+      });
+      uiApplySizing(panelEl);
+      alert('Instellingen gereset.');
+    }, true);
+
+    var legend = document.createElement('span');
+    legend.className = 'reqinfo-legend';
+    legend.textContent = '🎨 = kleur per item';
+
+    bar.appendChild(grpW);
+    bar.appendChild(grpF);
+    bar.appendChild(btnExport);
+    bar.appendChild(lblImport);
+    bar.appendChild(btnReset);
+    bar.appendChild(legend);
+
+    settings.appendChild(bar);
+
+    panelEl.insertBefore(settings, panelEl.firstChild);
+    panelEl.insertBefore(header, panelEl.firstChild);
+
+    uiApplySizing(panelEl);
+  }
+
+  function uiCreatePill(cfg, checked) {
+    var pill = document.createElement('label');
+    pill.className = 'reqinfo-pill';
+    pill.setAttribute('data-reqinfo-key', cfg.key);
+
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.dataset.reqinfoKey = cfg.key;
+    cb.checked = !!checked;
+
+    var label = document.createElement('span');
+    label.className = 'reqinfo-label';
+    label.textContent = cfg.label;
+
+    var tools = document.createElement('span');
+    tools.className = 'reqinfo-tools';
+
+    var btnPal = document.createElement('button');
+    btnPal.type = 'button';
+    btnPal.className = 'reqinfo-mini';
+    btnPal.textContent = '🎨';
+    btnPal.title = 'Kies kleur';
+
+    var btnReset = document.createElement('button');
+    btnReset.type = 'button';
+    btnReset.className = 'reqinfo-mini';
+    btnReset.textContent = '✕';
+    btnReset.title = 'Reset kleur';
+
+    var colorIn = document.createElement('input');
+    colorIn.type = 'color';
+    colorIn.className = 'reqinfo-colorin';
+
+    function applyFromPrefs() {
+      var p = uiLoadPrefs();
+      var c = (p.colors && p.colors[cfg.key]) ? String(p.colors[cfg.key]) : '';
+      if (c) {
+        try { colorIn.value = c; } catch {}
+        btnReset.style.display = '';
+        uiApplyPillColor(pill, c);
+      } else {
+        btnReset.style.display = 'none';
+        uiApplyPillColor(pill, null);
+      }
+    }
+
+    applyFromPrefs();
+
+    btnPal.addEventListener('click', function (ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      colorIn.click();
+    }, true);
+
+    colorIn.addEventListener('input', function () {
+      var val = String(colorIn.value || '').trim();
+      var p2 = uiLoadPrefs();
+      p2.colors = p2.colors || {};
+      p2.colors[cfg.key] = val;
+      uiSavePrefs(p2);
+      applyFromPrefs();
+    }, true);
+
+    btnReset.addEventListener('click', function (ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      var p3 = uiLoadPrefs();
+      if (p3.colors && p3.colors[cfg.key]) delete p3.colors[cfg.key];
+      uiSavePrefs(p3);
+      applyFromPrefs();
+    }, true);
+
+    tools.appendChild(btnPal);
+    tools.appendChild(btnReset);
+    tools.appendChild(colorIn);
+
+    pill.appendChild(cb);
+    pill.appendChild(label);
+    pill.appendChild(tools);
+
+    return pill;
+  }
+
+  // =========================
+  // BLOG "Geen 06" runner (AFTER status)
+  // =========================
+  function findGeen06AlreadyInLog() {
+    try {
+      var needle = norm(NO06_BLOG_TEXT);
+      if (!needle) return false;
+
+      var ta = document.getElementById('comment');
+      var nodes = Array.from(document.querySelectorAll('td,div,span,p,li'));
+      return nodes.some(function (n) {
+        if (!n) return false;
+        if (ta && (n === ta || n.contains(ta))) return false;
+        var t = norm(n.textContent || '');
+        return t.includes(needle);
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  function addBlogCommentRobust(text) {
+    var ta = document.getElementById('comment');
+    if (!ta) return false;
+
+    try { ta.focus(); } catch {}
+    ta.value = String(text || '');
+    try { ta.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+
+    var invoked = false;
+
+    if (typeof window.addcomment === 'function') {
+      try { window.addcomment(); invoked = true; } catch {}
+    }
+
+    if (!invoked) {
+      try {
+        var ev = new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 });
+        ta.dispatchEvent(ev);
+        invoked = true;
+      } catch {}
+    }
+
+    if (!invoked) {
+      try {
+        var tr = ta.closest('tr');
+        if (tr) {
+          var btn = tr.querySelector('button.button, button, input[type="button"], input.button, input[type="submit"]');
+          if (btn) { try { btn.click(); invoked = true; } catch {} }
+        }
+      } catch {}
+    }
+
+    return invoked;
+  }
+
+  function runGeen06BlogStepIfNeeded() {
+    var flow = getFlow();
+    if (!flow) return;
+
+    if (flow.needGeen06Blog !== true) return;
+    if (flow.blogGeen06Done === true) return;
+
+    if (flow.statusDone !== true) return;
+
+    var maxTries = 8;
+    var delayMs = 450;
+    var tries = 0;
+
+    log('Geen06 blog runner: start');
+
+    (function tick() {
+      var f = getFlow();
+      if (!f) return;
+      if (f.blogGeen06Done === true) return;
+
+      if (findGeen06AlreadyInLog()) {
+        setFlow({ blogGeen06Done: true, needGeen06Blog: false, stage: 'done_blog' }, false);
+        log('Geen06 blog runner: already present -> done');
+        return;
+      }
+
+      tries++;
+      var ok = addBlogCommentRobust(NO06_BLOG_TEXT);
+      log('Geen06 blog runner: try', tries, 'invoke=', ok);
+
+      setTimeout(function () {
+        if (findGeen06AlreadyInLog()) {
+          setFlow({ blogGeen06Done: true, needGeen06Blog: false, stage: 'done_blog' }, false);
+          log('Geen06 blog runner: verified in DOM -> done');
+          return;
+        }
+        if (tries >= maxTries) {
+          log('Geen06 blog runner: failed after retries (manual check needed)');
+          return;
+        }
+        tick();
+      }, delayMs);
+    })();
+  }
+
+  // =========================
+  // FINAL STATUS STEP (repair page)
+  // =========================
+  function clickWaitForCustomerButton() {
+    var btn = document.querySelector('button.button[onclick*="waitforcustomer"]');
+    if (!btn) {
+      btn = Array.from(document.querySelectorAll('button.button, button'))
+        .find(function (b) { return norm(b.textContent).includes('wacht op') && norm(b.textContent).includes('klant'); }) || null;
+    }
+    if (!btn) return false;
+    return runOnclickCode(btn, 'Status: Wacht op klant');
+  }
+
+  function selectAssistReasonExtraInfo() {
+    var sel = document.getElementById('assistoption');
+    if (!sel) return false;
+
+    var has55 = Array.from(sel.options || []).some(function (o) { return String(o.value) === STATUS_ASSIST_VALUE; });
+    if (!has55) {
+      var opt = Array.from(sel.options || []).find(function (o) { return norm(o.textContent).includes('extra informatie opgevraagd'); });
+      if (!opt) return false;
+      STATUS_ASSIST_VALUE = String(opt.value);
+    }
+
+    sel.value = String(STATUS_ASSIST_VALUE);
+    triggerChange(sel);
+    return true;
+  }
+
+  function runFinalStatusStepIfNeeded() {
+    var flow = getFlow();
+    if (!flow) return;
+
+    // allow status even if SMS was skipped due to NO06 or not found
+    var smsOk = (flow.smsDone === true) || (flow.smsSkipped === true) || (flow.smsNo06 === true);
+    if (!smsOk) return;
+
+    if (flow.statusDone === true) {
+      setTimeout(runGeen06BlogStepIfNeeded, 300);
+      return;
+    }
+
+    if (flow.statusRequested !== true) {
+      setFlow({ statusRequested: true, statusRequestedAt: now(), stage: 'status_requested' }, false);
+      log('Status step: starting (Wacht op klant -> Extra informatie opgevraagd)');
+    }
+
+    var clicked = clickWaitForCustomerButton();
+    if (clicked) log('Status step: clicked "Wacht op klant" button');
+
+    var started = now();
+    var timer = setInterval(function () {
+      var f = getFlow();
+      if (!f) { clearInterval(timer); return; }
+      if (f.statusDone === true) { clearInterval(timer); return; }
+
+      var ok = selectAssistReasonExtraInfo();
+      if (ok) {
+        setFlow({ statusDone: true, stage: 'done' }, false);
+        log('Status step: selected reason "Extra informatie opgevraagd" -> done');
+        clearInterval(timer);
+
+        setTimeout(runGeen06BlogStepIfNeeded, 500);
+
+        setTimeout(function () {
+          var ff = getFlow();
+          if (ff && ff.statusDone && (ff.smsDone || ff.smsSkipped || ff.smsNo06)) clearFlow('done');
+        }, 1800);
+        return;
+      }
+
+      if (now() - started > STATUS_WATCH_MAX_MS) {
+        log('Status step: timeout waiting for #assistoption');
+        clearInterval(timer);
+      }
+    }, 350);
+  }
+
+  // =========================
+  // REPAIR PAGE
+  // =========================
+  function initOnRepairPage() {
+    log('Detected reparatie edit page, initializing Request Extra Info panel');
+
+    var workdesc = document.getElementById('workdescription');
+    if (!workdesc) {
+      log('workdescription field not found, stop');
+      return;
+    }
+
+    startRepairFlowWatcher();
+
+    if (document.getElementById('reqinfo-panel')) {
+      log('ReqInfo panel already exists, skipping');
+      setTimeout(runFinalStatusStepIfNeeded, 350);
+      return;
+    }
+
+    var caseId = null;
+    var itemIdInput = document.querySelector('input[name="item_id"]');
+    if (itemIdInput && itemIdInput.value) caseId = itemIdInput.value.trim();
+    log('Case/Order ID on reparatie page:', caseId);
+
+    currentCustomerName = detectCustomerNameFromLegend();
+    log('Customer from legend:', currentCustomerName);
+
+    currentCustomerLanguage = detectCustomerLanguageOnRepairPage();
+    if (currentCustomerLanguage) log('Customer language detected:', currentCustomerLanguage);
+
+    var panel = document.createElement('div');
+    panel.id = 'reqinfo-panel';
+
+    uiAttachPanelHeader(panel);
+
+    var itemsConfig = [
+      { key: 'foto',   label: 'Klacht foto' },
+      { key: 'video',  label: 'Klacht video' },
+      { key: 'sn',     label: 'SN sticker' },
+      { key: 'akb',    label: 'AKB' },
+      { key: 'klacht', label: 'Klachtomschrijving' }
+    ];
+
+    var preSelected = {};
+    try {
+      if (caseId) {
+        var all = loadSelections();
+        if (all && all[caseId] && Array.isArray(all[caseId].items)) {
+          all[caseId].items.forEach(function (k) { preSelected[k] = true; });
+        }
+      }
+    } catch {}
+
+    var itemsRow = document.createElement('div');
+    itemsRow.className = 'reqinfo-items';
+
+    itemsConfig.forEach(function (cfg) {
+      var pill = uiCreatePill(cfg, !!preSelected[cfg.key]);
+      itemsRow.appendChild(pill);
+
+      var p = uiLoadPrefs();
+      var c = (p.colors && p.colors[cfg.key]) ? String(p.colors[cfg.key]) : '';
+      uiApplyPillColor(pill, c || null);
+    });
+
+    panel.appendChild(itemsRow);
+
+    uiApplySizing(panel);
+
+    var actions = document.createElement('div');
+    actions.className = 'reqinfo-actions';
+
+    var sendBtn = document.createElement('button');
+    sendBtn.type = 'button';
+    sendBtn.className = 'button';
+    sendBtn.style.whiteSpace = 'nowrap';
+    sendBtn.textContent = 'Stuur';
+
+    sendBtn.addEventListener('click', function () {
+      try { onRequestInfoSendClick(caseId); } catch (e) { log('Error on click:', e); }
+    }, true);
+
+    var hint = document.createElement('span');
+    hint.className = 'reqinfo-hint';
+    hint.textContent = '(Mail → sluit → SMS → Status → Blog)';
+
+    actions.appendChild(sendBtn);
+    actions.appendChild(hint);
+    panel.appendChild(actions);
+
+    workdesc.parentNode.insertBefore(panel, workdesc.nextSibling);
+    log('Request-info panel added near Workdescription');
+
+    setTimeout(runFinalStatusStepIfNeeded, 350);
+  }
+
+  function installNo06AlertHookOnce() {
+    if (window.__reqinfo_no06_hooked) return;
+    window.__reqinfo_no06_hooked = true;
+
+    var origAlert = window.alert;
+    window.alert = function (msg) {
+      try {
+        var s = String(msg || '');
+        if (norm(s).includes(NO06_PHRASE)) {
+          log('NO06 detected via alert hook -> auto-handle (skip SMS, continue)');
+          handleNo06Detected(s);
+          return;
+        }
+      } catch {}
+      try { return origAlert.call(window, msg); } catch { return; }
+    };
+  }
+
+  function handleNo06Detected(msg) {
+    var m = norm(msg || '');
+    if (!m.includes(NO06_PHRASE)) return false;
+
+    log('NO06 detected -> mark for blog after status; skip SMS');
+
+    setFlow({
+      smsRequested: false,
+      smsArmed: false,
+      smsNo06: true,
+      smsSkipped: true,
+      smsDone: true,
+      needGeen06Blog: true,
+      blogGeen06Done: false,
+      stage: 'sms_no06'
+    }, false);
+
+    setTimeout(runFinalStatusStepIfNeeded, 300);
+    return true;
+  }
+
+  function maybeOfferSwitchLanguageToNL(doneCb) {
+    try {
+      if (!OFFER_SWITCH_LANG_TO_NL) { doneCb(); return; }
+
+      var sel = document.getElementById('lst_Language');
+      if (!sel) { doneCb(); return; }
+
+      var val = String(sel.value || '').trim().toUpperCase();
+      if (!val) { doneCb(); return; }
+
+      currentCustomerLanguage = val;
+
+      if (val === 'NL') { doneCb(); return; }
+
+      // Ask user (still inside click handler)
+      var ok = window.confirm(
+        'Let op: Klanttaal staat op ' + val + '.\n' +
+        'De ReqInfo-flow werkt het meest stabiel met NL templates.\n\n' +
+        'Wil je klanttaal automatisch naar NL zetten?'
+      );
+
+      if (!ok) { doneCb(); return; }
+
+      sel.value = 'NL';
+      triggerChange(sel);
+      currentCustomerLanguage = 'NL';
+
+      // Give page a moment to apply any dynamic reloads
+      setTimeout(function () { doneCb(); }, 650);
+    } catch {
+      doneCb();
+    }
+  }
+
+  function onRequestInfoSendClick(caseId) {
+    var panel = document.getElementById('reqinfo-panel');
+    if (!panel) return;
+
+    var checkboxes = Array.from(panel.querySelectorAll('input[type="checkbox"][data-reqinfo-key]'));
+    var selectedKeys = checkboxes.filter(function (cb) { return cb.checked; }).map(function (cb) { return cb.dataset.reqinfoKey; });
+
+    if (!selectedKeys.length) {
+      window.alert('Selecteer minimaal één item dat je wil opvragen.');
+      return;
+    }
+
+    // Save selection immediately (so mail page can read it)
+    if (caseId) {
+      var all0 = loadSelections();
+      all0[caseId] = { items: selectedKeys };
+      saveSelections(all0);
+      log('Saved selected info-items for case', caseId, 'items:', selectedKeys.join(','));
+    }
+
+    // Optional language switch (NL stable templates)
+    maybeOfferSwitchLanguageToNL(function () {
+      var token = randToken();
+
+      setFlow({
+        origin: 'reqinfo',
+        token: token,
+        caseId: caseId,
+        custLang: currentCustomerLanguage || detectCustomerLanguageOnRepairPage() || null,
+        startedAt: now(),
+        stage: 'started',
+
+        mailRequested: false,
+        mailArmed: false,
+        mailOpenedAt: 0,
+        mailSending: false,
+        mailDone: false,
+        mailCloseArmed: false,
+        mailClosed: false,
+        mailClickedAt: 0,
+        mailCustomized: false,
+
+        smsRequested: false,
+        smsArmed: false,
+        smsOpenedAt: 0,
+        smsDone: false,
+        smsSkipped: false,
+        smsNo06: false,
+
+        statusRequested: false,
+        statusDone: false,
+
+        needGeen06Blog: false,
+        blogGeen06Done: false
+      }, true);
+
+      log('Flow started for case', caseId, 'token=', token);
+
+      var btnKlant = document.getElementById('btn_mail_klant');
+      var btnEig   = document.getElementById('btn_mail_eigenaar');
+
+      var preferKlant = false;
+      currentCustomerName = detectCustomerNameFromLegend();
+      if (currentCustomerName) {
+        var nameLower = currentCustomerName.toLowerCase();
+        var dealerKeywords = ['coolblue', 'zes', 'bcc', 'mediamarkt', 'bol', 'expert'];
+        preferKlant = dealerKeywords.some(function (k) { return nameLower.includes(k); });
+      }
+
+      log('Customer from legend:', currentCustomerName, '| preferKlant=', preferKlant);
+
+      var targetMailBtn = null;
+      var targetType = null;
+
+      if (preferKlant) {
+        if (isVisible(btnKlant)) { targetMailBtn = btnKlant; targetType = 'klant'; }
+        else if (isVisible(btnEig)) { targetMailBtn = btnEig; targetType = 'eigenaar'; }
+      } else {
+        if (isVisible(btnEig)) { targetMailBtn = btnEig; targetType = 'eigenaar'; }
+        else if (isVisible(btnKlant)) { targetMailBtn = btnKlant; targetType = 'klant'; }
+      }
+
+      if (!targetMailBtn) {
+        window.alert('Kon geen mail-knop vinden (bericht eig. / bericht klant).');
+        clearFlow('no_mail_button');
+        return;
+      }
+
+      // install NO06 alert hook on repair page (where alert originates)
+      installNo06AlertHookOnce();
+
+      // Open SMS popup NOW (user gesture) to avoid popup blocking,
+      // but SMS page will WAIT until mail is sent + closed.
+      var btnSms = document.getElementById('btn_sms');
+      if (btnSms && isVisible(btnSms)) {
+        setFlow({ smsRequested: true, smsArmed: true, smsOpenedAt: now(), stage: 'sms_opened' }, false);
+        log('Opening SMS popup (will wait until mail is sent + closed)');
+        runOnclickCode(btnSms, 'SMS open');
+      } else {
+        log('SMS button not found/visible right now.');
+      }
+
+      // Open Mail
+      setFlow({ mailRequested: true, mailArmed: true, mailOpenedAt: now(), stage: 'mail_opened' }, false);
+      log('Opening mail (stable invoke) for:', targetType);
+      runOnclickCode(targetMailBtn, 'Mail open');
+    });
+  }
+
+  function startRepairFlowWatcher() {
+    if (repairWatcherStarted) return;
+    repairWatcherStarted = true;
+
+    setInterval(function () {
+      var flow = getFlow();
+      if (!flow) return;
+
+      if ((flow.smsDone || flow.smsSkipped || flow.smsNo06) && !flow.statusDone) {
+        runFinalStatusStepIfNeeded();
+      }
+
+      if (flow.statusDone && flow.needGeen06Blog && !flow.blogGeen06Done) {
+        runGeen06BlogStepIfNeeded();
+      }
+    }, 900);
+  }
+
+  // =========================
+  // MAIL PAGE
+  // =========================
+  function mailBodyText() { return norm(document.body ? document.body.textContent : ''); }
+
+  function mailHasSuccess() {
+    var t = mailBodyText();
+    return t.includes('bericht is successvol verzonden') ||
+           t.includes('bericht is succesvol verzonden') ||
+           t.includes('message has been sent successfully') ||
+           (t.includes('verzonden') && t.includes('bericht')) ||
+           (t.includes('sent') && t.includes('message') && t.includes('success'));
+  }
+
+  function mailIsComposeContext() {
+    try {
+      if (document.getElementById('naam')) return true;
+      if (window.CKEDITOR && CKEDITOR.instances && CKEDITOR.instances.body) return true;
+    } catch {}
+    return false;
+  }
+
+  function tryClickMailCloseOnce() {
+    var closeBtn = findButtonByTextRegex(/\b(sluiten|close)\b/);
+    if (closeBtn) { try { closeBtn.click(); } catch {} return true; }
+    try { if (typeof window.closeit === 'function') { window.closeit(); return true; } } catch {}
+    return false;
+  }
+
+  function markMailClosedIfPossible() {
+    try {
+      var f = getFlow();
+      if (f && gateOk(f, 'mail')) {
+        setFlow({ mailClosed: true, stage: 'mail_closed' }, false);
+      }
+    } catch {}
+  }
+
+  function closeMailAggressiveLoop(totalMs) {
+    var started = now();
+    (function tick() {
+      // ensure SMS gate won't wait forever
+      markMailClosedIfPossible();
+
+      tryClickMailCloseOnce();
+      try { window.close(); } catch {}
+      if ((now() - started) >= (totalMs || 9000)) return;
+      setTimeout(tick, 250);
+    })();
+  }
+
+  function armMailCloseSignalsOnce() {
+    if (window.__reqinfo_mail_close_signals_armed) return;
+    window.__reqinfo_mail_close_signals_armed = true;
+
+    document.addEventListener('click', function (ev) {
+      var flow = getFlow();
+      if (!gateOk(flow, 'mail')) return;
+
+      var el = ev.target;
+      var btn = null;
+      try { btn = el && el.closest ? el.closest('button, input[type="button"], input[type="submit"], input.button, button.button') : null; } catch {}
+      if (!btn) return;
+
+      var txt = norm(btn.textContent || btn.value || '');
+
+      if (txt.indexOf('stuur') >= 0 || txt.indexOf('send') >= 0) {
+        setFlow({ mailSending: true, mailClickedAt: now(), mailCloseArmed: true, stage: 'mail_sending' }, false);
+        log('Mail: detected manual Send/Stuur click -> mailSending=true');
+        startMailAutoCloseLoop();
+        return;
+      }
+
+      if (txt.indexOf('sluiten') >= 0 || txt.indexOf('close') >= 0) {
+        var f2 = getFlow();
+        if (f2 && (f2.mailCloseArmed || f2.mailSending || f2.mailDone || mailHasSuccess() || !mailIsComposeContext())) {
+          setFlow({ mailClosed: true, stage: 'mail_closed' }, false);
+          log('Mail: detected manual Close/Sluiten click -> mailClosed=true');
+        }
+      }
+    }, true);
+
+    try {
+      if (typeof window.closeit === 'function' && !window.__reqinfo_wrapped_closeit) {
+        window.__reqinfo_wrapped_closeit = true;
+        var orig = window.closeit;
+        window.closeit = function () {
+          try {
+            var f = getFlow();
+            if (f && gateOk(f, 'mail') && (f.mailCloseArmed || f.mailSending || f.mailDone)) {
+              setFlow({ mailClosed: true, stage: 'mail_closed' }, false);
+              log('Mail: closeit() called -> mailClosed=true');
+            }
+          } catch {}
+          return orig.apply(this, arguments);
+        };
+      }
+    } catch {}
+
+    function markClosedIfArmed() {
+      try {
+        var f = getFlow();
+        if (!f || !gateOk(f, 'mail')) return;
+        if (f.mailCloseArmed || f.mailSending || f.mailDone) {
+          setFlow({ mailClosed: true, stage: 'mail_closed' }, false);
+        }
+      } catch {}
+    }
+    window.addEventListener('pagehide', markClosedIfArmed, { capture: true });
+    window.addEventListener('beforeunload', markClosedIfArmed, { capture: true });
+  }
+
+  function startMailSuccessWatcher(caseId) {
+    if (window.__reqinfo_mail_watch_started) return;
+    window.__reqinfo_mail_watch_started = true;
+
+    var started = now();
+
+    function onSuccess() {
+      if (window.__reqinfo_mail_success_handled) return;
+      window.__reqinfo_mail_success_handled = true;
+
+      setFlow({ mailDone: true, mailSending: false, mailCloseArmed: true, stage: 'mail_done' }, false);
+
+      log('Mail success detected -> closing window');
+      closeMailAggressiveLoop(10000);
+    }
+
+    var obs = null;
+    try {
+      obs = new MutationObserver(function () { if (mailHasSuccess()) onSuccess(); });
+      obs.observe(document.documentElement || document.body, { childList: true, subtree: true, characterData: true });
+    } catch {}
+
+    var poll = setInterval(function () {
+      if (mailHasSuccess()) onSuccess();
+      if (now() - started > MAIL_WATCH_MAX_MS) {
+        clearInterval(poll);
+        try { if (obs) obs.disconnect(); } catch {}
+      }
+    }, 350);
+  }
+
+  function startMailAutoCloseLoop() {
+    if (window.__reqinfo_mail_autoclose_started) return;
+    window.__reqinfo_mail_autoclose_started = true;
+
+    var started = now();
+    var timer = setInterval(function () {
+      var flow = getFlow();
+      if (!flow || !gateOk(flow, 'mail')) { clearInterval(timer); return; }
+
+      if (!(flow.mailSending || flow.mailCloseArmed || flow.mailDone)) return;
+
+      if (mailHasSuccess()) {
+        setFlow({ mailDone: true, mailSending: false, mailCloseArmed: true, stage: 'mail_done' }, false);
+        log('Mail: autoclose loop sees success -> closing');
+        closeMailAggressiveLoop(10000);
+        clearInterval(timer);
+        return;
+      }
+
+      var closeBtn = findButtonByTextRegex(/\b(sluiten|close)\b/);
+      if (closeBtn && !mailIsComposeContext()) {
+        setFlow({ mailDone: true, mailSending: false, mailCloseArmed: true, stage: 'mail_done' }, false);
+        log('Mail: autoclose loop found Close/Sluiten on non-compose -> clicking');
+        try { closeBtn.click(); } catch {}
+      }
+
+      if (now() - started > MAIL_WATCH_MAX_MS) {
+        clearInterval(timer);
+      }
+    }, 350);
+  }
+
+  function scoreTemplateText(t) {
+    var s = 0;
+    var tt = norm(t);
+    if (!tt) return 0;
+
+    // Regex bonus
+    MAIL_TEMPLATE_REGEXES.forEach(function (rx) {
+      try { if (rx.test(t)) s += 20; } catch {}
+    });
+
+    // Keyword hits
+    MAIL_TEMPLATE_KEYWORDS.forEach(function (k) {
+      if (tt.indexOf(k) >= 0) s += 3;
+    });
+
+    // Strong "correct template" signals
+    if (tt.includes('buitendienst') || tt.includes('field service') || tt.includes('field engineer') || tt.includes('field')) s += 10;
+    if (tt.indexOf('extra') >= 0 && (tt.indexOf('informatie') >= 0 || tt.indexOf('information') >= 0)) s += 10;
+
+    // Penalize very "device/order specific" templates (often different structure)
+    if (tt.includes('order no') || tt.includes('your reference') || tt.includes('uw referentie') || tt.includes('order nummer')) s -= 18;
+
+    // Avoid placeholders
+    if (tt === '-' || tt === '--' || tt.indexOf('kies') >= 0 || tt.indexOf('select') >= 0 || tt.indexOf('choose') >= 0) s -= 10;
+
+    return s;
+  }
+
+  function findBestTemplateOption(selectEl) {
+    if (!selectEl || !selectEl.options) return null;
+    var best = null;
+    var bestScore = -999;
+
+    Array.from(selectEl.options).forEach(function (opt) {
+      var text = (opt.textContent || '').trim();
+      var sc = scoreTemplateText(text);
+      if (sc > bestScore) { bestScore = sc; best = opt; }
+    });
+
+    if (best && bestScore >= 10) return best; // threshold
+    return null;
+  }
+
+  function waitForTemplateOptionsThenProceed(caseId, items) {
+    var maxMs = 12000;
+    var intervalMs = 250;
+    var start = now();
+
+    var timer = setInterval(function () {
+      try {
+        var naamSel = document.getElementById('naam');
+        if (!naamSel) {
+          if (now() - start > maxMs) { clearInterval(timer); log('Mail: #naam not found after wait'); }
+          return;
+        }
+
+        var optCount = (naamSel.options ? naamSel.options.length : 0);
+        if (optCount < 2) {
+          if (now() - start > maxMs) {
+            clearInterval(timer);
+            log('Mail: #naam options not ready (count=' + optCount + '), proceeding without template select');
+            waitForEditorAndCustomize(caseId, items);
+          }
+          return;
+        }
+
+        // Options are ready
+        clearInterval(timer);
+
+        var currentOpt = naamSel.options[naamSel.selectedIndex];
+        var currentText = currentOpt ? (currentOpt.textContent || '').trim() : '';
+        var best = findBestTemplateOption(naamSel);
+
+        if (best && (naamSel.value !== best.value)) {
+          log('Mail: selecting best template:', (best.textContent || '').trim(), '| current was:', currentText);
+          naamSel.value = best.value;
+          triggerChange(naamSel);
+
+          // After template loads body, continue to editor customization.
+          setTimeout(function () {
+            waitForEditorAndCustomize(caseId, items);
+          }, 900);
+        } else {
+          if (!best) log('Mail: template not found in #naam (fuzzy); continue with current template');
+          else log('Mail: current template already best; continue');
+          waitForEditorAndCustomize(caseId, items);
+        }
+      } catch (e) {
+        clearInterval(timer);
+        log('Mail: waitForTemplateOptionsThenProceed error', e);
+      }
+    }, intervalMs);
+  }
+
+  function initOnMailPage() {
+    log('Mail context detected');
+
+    var flow = getFlow();
+    if (!gateOk(flow, 'mail')) {
+      log('Mail: gate blocked (manual mail / stale flow) -> do nothing');
+      return;
+    }
+
+    armMailCloseSignalsOnce();
+
+    var caseIdInput = document.getElementById('case_id');
+    var caseId = (caseIdInput && caseIdInput.value ? caseIdInput.value.trim() : null) || (flow && flow.caseId) || null;
+    log('Mail case_id:', caseId || '(none)');
+
+    startMailSuccessWatcher(caseId);
+
+    if (mailHasSuccess()) {
+      log('Mail already success on load -> close');
+      setFlow({ mailDone: true, mailSending: false, mailCloseArmed: true, stage: 'mail_done' }, false);
+      closeMailAggressiveLoop(10000);
+      return;
+    }
+
+    var fNow = getFlow();
+    if (fNow && (fNow.mailSending || fNow.mailCloseArmed)) {
+      startMailAutoCloseLoop();
+    }
+
+    if (!caseId) {
+      log('Mail: no case id available, cannot customize template reliably');
+      return;
+    }
+
+    // If already customized once in this flow, don't do again (prevents duplicates on reload)
+    if (fNow && fNow.mailCustomized === true) {
+      log('Mail: already customized in this flow -> skip customization');
+      return;
+    }
+
+    var all = loadSelections();
+    var data = all[caseId];
+    if (!data || !Array.isArray(data.items) || !data.items.length) {
+      log('Mail: no stored selection for this case, nothing to do');
+      return;
+    }
+
+    waitForTemplateOptionsThenProceed(caseId, data.items);
+  }
+
+  function waitForEditorAndCustomize(caseId, items) {
+    var maxMs = 12000;
+    var intervalMs = 300;
+    var start = Date.now();
+
+    var timer = setInterval(function () {
+      try {
+        if (!window.CKEDITOR || !CKEDITOR.instances || !CKEDITOR.instances.body) {
+          if (Date.now() - start > maxMs) { clearInterval(timer); log('Mail: timeout CKEDITOR.instances.body not found'); }
+          return;
+        }
+        var editor = CKEDITOR.instances.body;
+        if (!editor || editor.status !== 'ready') {
+          if (Date.now() - start > maxMs) { clearInterval(timer); log('Mail: timeout CKEditor body not ready'); }
+          return;
+        }
+        clearInterval(timer);
+        customizeEmailBody(editor, caseId, items);
+      } catch (e) {
+        clearInterval(timer);
+        log('Mail: error waitForEditorAndCustomize:', e);
+      }
+    }, intervalMs);
+  }
+
+  function stripTags(html) {
+    try { return String(html || '').replace(/<[^>]+>/g, ' '); } catch { return String(html || ''); }
+  }
+
+  function findMarkerIndex(lowerHtml, markers) {
+    for (var i = 0; i < markers.length; i++) {
+      var m = markers[i];
+      var idx = lowerHtml.indexOf(m);
+      if (idx !== -1) return { idx: idx, marker: m };
+    }
+    return null;
+  }
+
+  function findBestUlBlockToReplace(html, lang) {
+    try {
+      var blocks = [];
+      var rx = /<ul[^>]*>[\s\S]*?<\/ul>/ig;
+      var m;
+      while ((m = rx.exec(html)) !== null) {
+        blocks.push({ start: m.index, end: m.index + m[0].length, html: m[0] });
+      }
+      if (!blocks.length) return null;
+
+      var keywords = (lang === 'EN')
+        ? ['photo', 'video', 'serial', 'model', 'purchase', 'proof', 'invoice', 'complaint', 'description', 'sticker']
+        : ['foto', 'video', 'serienummer', 'model', 'aankoopbewijs', 'klacht', 'omschrijving', 'sticker'];
+
+      var best = null;
+      var bestScore = -999;
+
+      blocks.forEach(function (b) {
+        var txt = norm(stripTags(b.html));
+        var s = 0;
+        keywords.forEach(function (k) { if (txt.includes(k)) s += 3; });
+        // UL with at least 2 <li> is more likely "the list"
+        var liCount = (b.html.match(/<li\b/ig) || []).length;
+        if (liCount >= 2) s += 2;
+        if (txt.includes('unsubscribe') || txt.includes('privacy')) s -= 10;
+        if (s > bestScore) { bestScore = s; best = b; }
+      });
+
+      if (best && bestScore >= 6) return best;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  function customizeEmailBody(editor, caseId, items) {
+    var flow = getFlow() || {};
+    var lang = String(flow.custLang || '').toUpperCase() || 'NL';
+
+    // Bullet texts per language (NL default, EN if customer language EN)
+    var bulletMapNL = {
+      foto: 'Een foto van de klacht',
+      video: 'Een video van de klacht',
+      sn: 'Een foto van de volledige model en serienummer sticker (TV: achterzijde, soms zijkant / Witgoed: binnenkant deur, achterzijde, binnenkant filterklep / Andere producten: achterzijde)',
+      akb: 'Een duidelijke kopie/foto van het volledige aankoopbewijs (zonder pinbon ervoor). Let op: een bankafschrift of bestelbon voldoet niet.',
+      klacht: 'Een volledige en uitgebreide klachtomschrijving'
+    };
+
+    var bulletMapEN = {
+      foto: 'A photo of the issue',
+      video: 'A video of the issue',
+      sn: 'A photo of the full model & serial number sticker (TV: back side, sometimes side / White goods: inside door, back side, inside filter flap / Other products: back side)',
+      akb: 'A clear copy/photo of the full proof of purchase (no PIN receipt). Note: a bank statement or order confirmation is not accepted.',
+      klacht: 'A complete and detailed complaint description'
+    };
+
+    var bulletMap = (lang === 'EN') ? bulletMapEN : bulletMapNL;
+
+    var seen = new Set();
+    var ulHtml = '<!-- ' + MAIL_UL_SIGNATURE + ' --><ul>';
+    items.forEach(function (key) {
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      var txt = bulletMap[key];
+      if (!txt) return;
+      ulHtml += '<li><span style="color:rgb(255, 0, 0)">' + txt + '</span></li>';
+    });
+    ulHtml += '</ul>';
+
+    var html = editor.getData() || '';
+
+    // Avoid double injection
+    if (html && html.indexOf(MAIL_UL_SIGNATURE) !== -1) {
+      log('Mail: signature found -> already injected; skip');
+      setFlow({ mailCustomized: true }, false);
+      return;
+    }
+
+    var lower = String(html || '').toLowerCase();
+
+    // Marker phrases in both NL and EN (templates differ by language/structure)
+    var markers = [
+      // NL variants
+      'het volgende toe te sturen:',
+      'het volgende toe te sturen',
+      'graag het volgende toe te sturen:',
+      'graag het volgende toe te sturen',
+      'gelieve het volgende toe te sturen:',
+      'gelieve het volgende toe te sturen',
+      // EN variants
+      'please send the following:',
+      'please send the following',
+      'please provide the following:',
+      'please provide the following',
+      'please send us the following:',
+      'please send us the following',
+      'kindly send the following:',
+      'kindly send the following',
+      'send the following:',
+      'send the following'
+    ];
+
+    var markerHit = findMarkerIndex(lower, markers);
+
+    if (markerHit) {
+      var markerIndex = markerHit.idx;
+      var marker = markerHit.marker;
+      var endIdx = markerIndex + marker.length;
+
+      var afterMarkerHtml = html.slice(markerIndex);
+      var ulMatch = afterMarkerHtml.match(/<ul[^>]*>[\s\S]*?<\/ul>/i);
+
+      if (ulMatch) {
+        var fullUl = ulMatch[0];
+        var ulGlobalIndex = markerIndex + ulMatch.index;
+        html = html.slice(0, ulGlobalIndex) + ulHtml + html.slice(ulGlobalIndex + fullUl.length);
+        log('Mail: replaced UL after marker:', marker);
+      } else {
+        html = html.slice(0, endIdx) + '<br />' + ulHtml + html.slice(endIdx);
+        log('Mail: inserted UL after marker (no UL found):', marker);
+      }
+    } else {
+      // Fallback: replace the "most likely" UL block
+      var bestUl = findBestUlBlockToReplace(html, lang);
+      if (bestUl) {
+        html = html.slice(0, bestUl.start) + ulHtml + html.slice(bestUl.end);
+        log('Mail: marker not found -> replaced best UL block (heuristic)');
+      } else {
+        // Final fallback: append a clear section
+        var intro = (lang === 'EN')
+          ? '<p><strong>Please send the following:</strong></p>'
+          : '<p><strong>Graag het volgende toe te sturen:</strong></p>';
+        html += intro + ulHtml;
+        log('Mail: marker + UL not found -> appended section at end');
+      }
+    }
+
+    editor.setData(html, function () {
+      log('Mail: body customized for case', caseId);
+
+      // Mark customized to avoid duplicates on reload
+      setFlow({ mailCustomized: true }, false);
+
+      // Auto click Send/Stuur
+      setFlow({ mailSending: true, mailClickedAt: now(), mailCloseArmed: true, stage: 'mail_sending' }, false);
+
+      var stuurBtn = findButtonByTextRegex(/\b(stuur|send)\b/);
+      if (stuurBtn) {
+        log('Mail: clicking Send/Stuur');
+        try { stuurBtn.click(); } catch {}
+        // Once we clicked send, remove stored selection for this case (no more reruns)
+        try {
+          var all = loadSelections();
+          delete all[caseId];
+          saveSelections(all);
+        } catch {}
+      } else {
+        log('Mail: Send/Stuur button not found -> keep selection for manual send/retry');
+      }
+
+      startMailAutoCloseLoop();
+    });
+  }
+
+  // =========================
+  // SMS POPUP PAGE
+  // =========================
+  function smsOkDetected() {
+    var msg = document.getElementById('message');
+    var msgTxt = norm(msg ? msg.textContent : '');
+    return msgTxt.startsWith('ok') && msgTxt.includes('messageid');
+  }
+
+  function smsFindBodyElement() {
+    var tas = Array.from(document.querySelectorAll('textarea')).filter(isNodeVisible);
+    if (tas.length === 1) return tas[0];
+    if (tas.length > 1) {
+      tas.sort(function (a, b) { return (b.value || '').length - (a.value || '').length; });
+      return tas[0];
+    }
+
+    var candidates = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(isNodeVisible);
+    if (candidates.length) {
+      var best = null, bestScore = -1;
+      candidates.forEach(function (el) {
+        var id = norm(el.id || '');
+        var nm = norm(el.name || '');
+        var s = 0;
+        if (id.indexOf('sms') >= 0 || nm.indexOf('sms') >= 0) s += 3;
+        if (id.indexOf('bericht') >= 0 || nm.indexOf('bericht') >= 0) s += 3;
+        if (id.indexOf('message') >= 0 || nm.indexOf('message') >= 0) s += 3;
+        if (id.indexOf('tekst') >= 0 || nm.indexOf('tekst') >= 0) s += 2;
+        if (s > bestScore) { bestScore = s; best = el; }
+      });
+      return best || candidates[0];
+    }
+
+    return null;
+  }
+
+  function smsGetBodyText() {
+    var el = smsFindBodyElement();
+    if (!el) return '';
+    var v = '';
+    try { v = (typeof el.value === 'string') ? el.value : (el.textContent || ''); } catch { v = ''; }
+    return String(v || '');
+  }
+
+  function scoreSmsTemplateText(t) {
+    var tt = norm(t);
+    if (!tt) return 0;
+
+    var s = 0;
+
+    // Strong signals
+    if (tt.includes('email') || tt.includes('e-mail')) s += 12;
+    if (tt.includes('reactie') || tt.includes('reply') || tt.includes('response') || tt.includes('reaction')) s += 10;
+    if (tt.includes('melding') || tt.includes('notification') || tt.includes('message')) s += 5;
+
+    // Keyword bonus
+    SMS_TEMPLATE_KEYWORDS.forEach(function (k) {
+      if (tt.includes(k)) s += 2;
+    });
+
+    // Avoid wrong templates
+    SMS_TEMPLATE_AVOID.forEach(function (bad) {
+      if (tt.includes(bad)) s -= 6;
+    });
+
+    // Penalize placeholders
+    if (tt === '-' || tt === '--' || tt.includes('kies') || tt.includes('select') || tt.includes('choose')) s -= 10;
+
+    return s;
+  }
+
+  function findBestSmsTemplateOption(sel) {
+    if (!sel || !sel.options) return null;
+
+    // 1) exact match first
+    var exactSet = new Set(SMS_TEMPLATE_EXACT.map(function (x) { return norm(x); }));
+    var exactOpt = Array.from(sel.options).find(function (o) {
+      return exactSet.has(norm(o.textContent || ''));
+    });
+    if (exactOpt) return exactOpt;
+
+    // 2) scoring
+    var best = null;
+    var bestScore = -999;
+    Array.from(sel.options).forEach(function (opt) {
+      var text = (opt.textContent || '').trim();
+      var sc = scoreSmsTemplateText(text);
+      if (sc > bestScore) { bestScore = sc; best = opt; }
+    });
+
+    if (best && bestScore >= SMS_TEMPLATE_MIN_SCORE) return best;
+    return null;
+  }
+
+  function initOnSmsPage() {
+    log('SMS popup detected');
+
+    var flow = getFlow();
+
+    if (!gateOk(flow, 'sms')) {
+      log('SMS: gate blocked (manual SMS / stale flow) -> do nothing');
+      return;
+    }
+
+    var tick = setInterval(function () {
+      var f = getFlow();
+      if (!f) { clearInterval(tick); return; }
+
+      if (f.smsNo06 === true || f.smsSkipped === true) {
+        clearInterval(tick);
+        try { window.close(); } catch {}
+        return;
+      }
+
+      if (smsOkDetected()) {
+        setFlow({ smsDone: true, smsRequested: false, smsArmed: false, stage: 'sms_done' }, false);
+        log('SMS OK detected -> close');
+        try { window.close(); } catch {}
+        clearInterval(tick);
+        return;
+      }
+
+      if (SMS_REQUIRE_MAIL_DONE_AND_CLOSED) {
+        if (f.mailClosed !== true) return;
+
+        var mailOk = (f.mailDone === true) ||
+                     (f.mailSending === true && (now() - Number(f.mailClickedAt || 0)) > 2000) ||
+                     (f.mailCloseArmed === true && (now() - Number(f.mailClickedAt || 0)) > 2000);
+
+        if (!mailOk) return;
+      }
+
+      var sel = document.getElementById('lst_tekst');
+      var btnSend = document.getElementById('btnsend');
+      if (!sel || !btnSend) return;
+
+      // If template is not found, do NOT keep hijacking later manual opens
+      // We'll show one alert and mark smsSkipped so the flow can continue.
+      function failSmsAuto(reason) {
+        try { log('SMS: auto failed ->', reason); } catch {}
+        setFlow({ smsSkipped: true, smsDone: true, smsRequested: false, smsArmed: false, stage: 'sms_skipped' }, false);
+        clearInterval(tick);
+        try {
+          if (!window.__reqinfo_sms_fail_alerted) {
+            window.__reqinfo_sms_fail_alerted = true;
+            alert('Kon geen geschikte SMS-sneltekst automatisch selecteren.\nSelecteer de SMS-sneltekst handmatig en klik zelf op Stuur.');
+          }
+        } catch {}
+        // Do not close window; user might still want to send manually
+        setTimeout(runFinalStatusStepIfNeeded, 400);
+      }
+
+      var selectedText = (sel.options[sel.selectedIndex] && sel.options[sel.selectedIndex].textContent ? sel.options[sel.selectedIndex].textContent : '').trim();
+      var selectedScore = scoreSmsTemplateText(selectedText);
+      var selectedOk = selectedScore >= SMS_TEMPLATE_MIN_SCORE;
+
+      if (!selectedOk) {
+        var bestOpt = findBestSmsTemplateOption(sel);
+
+        if (!bestOpt) {
+          try {
+            var optList = Array.from(sel.options).map(function (o) { return (o.textContent || '').trim(); });
+            log('SMS: no suitable template found. Options:', optList);
+          } catch {}
+          failSmsAuto('no suitable template');
+          return;
+        }
+
+        window.__reqinfo_sms_body_before = smsGetBodyText();
+        window.__reqinfo_sms_template_selected_at = now();
+        window.__reqinfo_sms_change_retry_count = 0;
+        window.__reqinfo_sms_last_retry_at = 0;
+
+        log('SMS: selecting best template:', (bestOpt.textContent || '').trim(), 'score=', scoreSmsTemplateText(bestOpt.textContent || ''));
+        sel.value = bestOpt.value;
+        triggerChange(sel);
+        return;
+      }
+
+      if (!window.__reqinfo_sms_template_selected_at) {
+        window.__reqinfo_sms_template_selected_at = now();
+        window.__reqinfo_sms_body_before = smsGetBodyText();
+        window.__reqinfo_sms_change_retry_count = 0;
+        window.__reqinfo_sms_last_retry_at = 0;
+      }
+
+      var sinceSel = now() - Number(window.__reqinfo_sms_template_selected_at || now());
+      var body = smsGetBodyText();
+      var bodyTrim = String(body || '').trim();
+      var before = String(window.__reqinfo_sms_body_before || '');
+      var bodyReady =
+        bodyTrim.length >= SMS_BODY_MIN_LEN &&
+        (sinceSel >= SMS_AFTER_SELECT_MIN_MS) &&
+        (bodyTrim !== String(before || '').trim() || bodyTrim.length >= 5);
+
+      if (!bodyReady) {
+        if (sinceSel >= SMS_CHANGE_RETRY_MS) {
+          var lastR = Number(window.__reqinfo_sms_last_retry_at || 0);
+          var cnt = Number(window.__reqinfo_sms_change_retry_count || 0);
+          if (cnt < SMS_CHANGE_MAX_RETRIES && (now() - lastR) >= 900) {
+            window.__reqinfo_sms_last_retry_at = now();
+            window.__reqinfo_sms_change_retry_count = cnt + 1;
+            log('SMS: body not ready yet, retry triggerChange()', window.__reqinfo_sms_change_retry_count);
+            try { triggerChange(sel); } catch {}
+          }
+        }
+
+        if (sinceSel > SMS_BODY_WAIT_MAX_MS) {
+          log('SMS: timeout waiting for body to populate -> NOT sending');
+          failSmsAuto('body did not populate');
+          return;
+        }
+        return;
+      }
+
+      if (window.__reqinfo_sms_send_clicked) return;
+      window.__reqinfo_sms_send_clicked = true;
+
+      log('SMS: body ready (' + bodyTrim.length + ' chars) -> clicking Stuur');
+      try { btnSend.click(); } catch {}
+    }, 400);
+  }
+
+  // =========================
+  // CONTEXT DETECTION (ROBUST BOOT LOOP)
+  // =========================
+  log('Loaded URL:', window.location.href);
+
+  function bodyHas(s) {
+    try { return norm(document.body ? document.body.textContent : '').includes(norm(s)); }
+    catch { return false; }
+  }
+
+  function detectNow() {
+    var href = String(window.location.href || '');
+
+    var repair = /\/webos_net\/edit\.ashx\?name=reparatie/i.test(href);
+
+    var mail =
+      /mailnewmessage\.aspx/i.test(href) ||
+      !!document.getElementById('naam') ||
+      !!document.getElementById('case_id') ||
+      (typeof window.CKEDITOR !== 'undefined' && !!(window.CKEDITOR.instances && window.CKEDITOR.instances.body)) ||
+      bodyHas('bericht is successvol verzonden') ||
+      bodyHas('bericht is succesvol verzonden') ||
+      bodyHas('message has been sent successfully');
+
+    var sms =
+      /sms\.aspx/i.test(href) ||
+      (!!document.getElementById('lst_tekst') && !!document.getElementById('btnsend'));
+
+    return { repair: repair, mail: mail, sms: sms };
+  }
+
+  if (!window.__reqinfo_boot) window.__reqinfo_boot = { repair: false, mail: false, sms: false, startedAt: 0 };
+
+  safeInit(function () {
+    if (window.__reqinfo_boot.startedAt) return;
+    window.__reqinfo_boot.startedAt = now();
+
+    var start = now();
+    var MAX_BOOT_MS = 20000;
+    var TICK_MS = 250;
+
+    var timer = setInterval(function () {
+      var d = detectNow();
+
+      // Prefer specific popups
+      if (d.mail && !window.__reqinfo_boot.mail) {
+        window.__reqinfo_boot.mail = true;
+        log('BOOT: mail detected -> initOnMailPage()');
+        try { initOnMailPage(); } catch (e1) { log('BOOT: initOnMailPage error', e1); }
+      }
+
+      if (d.sms && !window.__reqinfo_boot.sms) {
+        window.__reqinfo_boot.sms = true;
+        log('BOOT: sms detected -> initOnSmsPage()');
+        try { initOnSmsPage(); } catch (e2) { log('BOOT: initOnSmsPage error', e2); }
+      }
+
+      if (d.repair && !window.__reqinfo_boot.repair && !d.mail && !d.sms) {
+        window.__reqinfo_boot.repair = true;
+        log('BOOT: repair detected -> initOnRepairPage()');
+        try { initOnRepairPage(); } catch (e3) { log('BOOT: initOnRepairPage error', e3); }
+      }
+
+      if ((window.__reqinfo_boot.mail || window.__reqinfo_boot.sms || window.__reqinfo_boot.repair) && (now() - start) > 1200) {
+        clearInterval(timer);
+        return;
+      }
+
+      if (now() - start > MAX_BOOT_MS) {
+        log('BOOT: timeout - no context detected (mail/sms/repair).');
+        clearInterval(timer);
+      }
+    }, TICK_MS);
+  });
+
+})();
