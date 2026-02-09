@@ -1,0 +1,1406 @@
+// ==UserScript==
+// @name         CERepair Audio Screening Orchestrator + IRIS AutoFill v1.3.0 (perm-fix hop + skip top N)
+// @namespace    https://groupwise.cerepair.nl/
+// @version      1.3.0
+// @description  Stable Audio-Screening -> Groupwise IRIS automation with retries/watchdog, popup suppression, permission hop fix, and Skip Top N.
+// @match        https://nodered.ceonline.eu:1880/cerepair-dashboard/*
+// @match        https://groupwise.cerepair.nl/*
+// @run-at       document-start
+// @grant        GM_openInTab
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
+// @noframes     false
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // =============================== CONFIG ===============================
+  const CFG = {
+    LOG_PREFIX: '[GXO-IRIS-AUTO v1.3.0]',
+    OPEN_TAB_ACTIVE: true,
+
+    // Flow timings
+    NEXT_ORDER_DELAY_MS: 2500,
+    NO_ORDERS_POLL_MS: 12000,
+    ORDER_TOTAL_TIMEOUT_MS: 45 * 60 * 1000, // 45 min
+    HEARTBEAT_SILENT_MS: 180000,            // 3 min
+    MAX_ATTEMPTS_PER_ORDER: 3,
+
+    // IRIS delays
+    STEP_DELAY_MIN_MS: 4 * 60 * 1000 + 30 * 1000, // 4:30
+    STEP_DELAY_MAX_MS: 5 * 60 * 1000,             // 5:00
+
+    HEARTBEAT_INTERVAL_MS: 15000,
+
+    // Permission-fix hop
+    MAX_PERMISSION_HOPS: 3,
+    PERM_FIX_WAIT_MS: 3000,
+
+    // Schedule (Europe/Amsterdam)
+    SCHEDULE_TZ: 'Europe/Amsterdam',
+    SCHEDULE_ENABLED_DEFAULT: false,
+    SCHEDULE_WEEKDAYS: [1, 2, 3, 4, 5], // Mon..Fri
+    SCHEDULE_START: '06:55',
+    SCHEDULE_END: '17:45',
+    SCHEDULE_CHECK_MS: 30000,
+
+    // UI/Highlight
+    HIGHLIGHT_BG: 'rgba(250, 204, 21, 0.72)',
+    HIGHLIGHT_COLOR: '#111827',
+
+    // Workdescription touch
+    WORKDESC_ZWS: '\u200B',
+  };
+
+  const IRIS_STEPS = [
+    { id: 'lst_condition', want: '1',   textStarts: '1.',   label: 'Condition=1' },
+    { id: 'lst_symptom',   want: '111', textStarts: '111.', label: 'Symptom=111' }, // может fallback
+    { id: 'lst_section',   want: 'G00', textStarts: 'G00.', label: 'Section=G00' },
+    { id: 'lst_defect',    want: 'N',   textStarts: 'N.',   label: 'Defect=N' },
+    { id: 'lst_repair',    want: 'A',   textStarts: 'A.',   label: 'Repair=A' },
+  ];
+
+  const KEY = {
+    CLICKED_MAP: 'ce_iris_clicked_map_v130',
+    AUTO_ENABLED: 'ce_iris_auto_enabled_v130',
+    SKIP_TOP: 'ce_iris_skip_top_v130',
+    DASH_STATE: 'ce_iris_dash_state_v130',
+    EVENT_PROGRESS: 'ce_iris_progress_v130',
+    EVENT_RESULT: 'ce_iris_result_v130',
+    EVENT_HEARTBEAT: 'ce_iris_heartbeat_v130',
+  };
+
+  const isDashboard = location.hostname === 'nodered.ceonline.eu'
+    && location.pathname.includes('/cerepair-dashboard/');
+
+  const isGroupwise = location.hostname === 'groupwise.cerepair.nl';
+  const isGroupwiseViewTab = isGroupwise && location.pathname.includes('/webos_net/viewtab.ashx');
+  const isGroupwiseRoot = isGroupwise && (location.pathname === '/' || location.pathname === '');
+
+  const qs = new URLSearchParams(location.search);
+  const tabId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // =============================== HELPERS ===============================
+  const log = (...a) => console.log(CFG.LOG_PREFIX, ...a);
+  const now = () => Date.now();
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function randInt(min, max) {
+    return Math.floor(min + Math.random() * (max - min + 1));
+  }
+
+  function fmtSec(sec) {
+    const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+    const ss = String(sec % 60).padStart(2, '0');
+    return `${mm}:${ss}`;
+  }
+
+  async function gmSet(key, value) {
+    const r = GM_setValue(key, value);
+    if (r && typeof r.then === 'function') await r;
+  }
+
+  async function gmGet(key, fallback) {
+    const r = GM_getValue(key, fallback);
+    return (r && typeof r.then === 'function') ? await r : r;
+  }
+
+  async function emitProgress(payload) {
+    await gmSet(KEY.EVENT_PROGRESS, {
+      ...payload,
+      ts: now(),
+      eventId: `${now()}-${Math.random().toString(36).slice(2, 9)}`
+    });
+  }
+
+  async function emitResult(payload) {
+    await gmSet(KEY.EVENT_RESULT, {
+      ...payload,
+      ts: now(),
+      eventId: `${now()}-${Math.random().toString(36).slice(2, 9)}`
+    });
+  }
+
+  async function emitHeartbeat(payload) {
+    await gmSet(KEY.EVENT_HEARTBEAT, {
+      ...payload,
+      ts: now(),
+      eventId: `${now()}-${Math.random().toString(36).slice(2, 9)}`
+    });
+  }
+
+  async function waitFor(checkFn, timeoutMs = 20000, intervalMs = 150) {
+    const t0 = now();
+    while (now() - t0 < timeoutMs) {
+      try {
+        const v = checkFn();
+        if (v) return v;
+      } catch {}
+      await sleep(intervalMs);
+    }
+    return null;
+  }
+
+  function isVisible(el, doc = document) {
+    if (!el) return false;
+    const cs = (doc.defaultView || window).getComputedStyle(el);
+    if (!cs) return false;
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+    return true;
+  }
+
+  function safeCloseTab() {
+    try { window.close(); } catch {}
+    setTimeout(() => {
+      try { window.open('', '_self'); window.close(); } catch {}
+    }, 800);
+  }
+
+  function parseHM(hm) {
+    const [h, m] = hm.split(':').map(v => parseInt(v, 10));
+    return h * 60 + m;
+  }
+
+  function amsDate() {
+    return new Date(new Date().toLocaleString('en-US', { timeZone: CFG.SCHEDULE_TZ }));
+  }
+
+  function inScheduleWindow() {
+    const d = amsDate();
+    const wd = d.getDay(); // 0..6
+    if (!CFG.SCHEDULE_WEEKDAYS.includes(wd)) return false;
+    const mins = d.getHours() * 60 + d.getMinutes();
+    return mins >= parseHM(CFG.SCHEDULE_START) && mins <= parseHM(CFG.SCHEDULE_END);
+  }
+
+  function isTopWindow() {
+    try { return window.top === window.self; } catch { return true; }
+  }
+
+  // =============================== DEEP DOC SEARCH ===============================
+  function getAccessibleDocs(rootWin = window.top) {
+    const out = [];
+    const seen = new WeakSet();
+
+    function visit(w) {
+      let d;
+      try { d = w.document; } catch { return; }
+      if (!d || seen.has(d)) return;
+      seen.add(d);
+      out.push({ win: w, doc: d });
+
+      let n = 0;
+      try { n = w.frames.length; } catch { n = 0; }
+      for (let i = 0; i < n; i++) {
+        try { visit(w.frames[i]); } catch {}
+      }
+    }
+
+    visit(rootWin);
+    return out;
+  }
+
+  function findByIdDeep(id) {
+    const docs = getAccessibleDocs();
+    for (const x of docs) {
+      const el = x.doc.getElementById(id);
+      if (el) return { ...x, el };
+    }
+    return null;
+  }
+
+  // =============================== PERMISSION DETECT ===============================
+  function isPermissionErrorText(str) {
+    return String(str || '').toLowerCase().includes('insufficient permissions for template reparatie');
+  }
+
+  function permissionErrorDetectedDeep() {
+    try {
+      const docs = getAccessibleDocs();
+      for (const x of docs) {
+        const txt = x.doc?.documentElement?.innerText || '';
+        const html = x.doc?.documentElement?.outerHTML || '';
+        if (isPermissionErrorText(txt) || isPermissionErrorText(html)) return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  function buildPermFixUrl(returnUrl, runId, order, hop) {
+    const u = new URL('https://groupwise.cerepair.nl/');
+    u.searchParams.set('tm_perm_fix', '1');
+    u.searchParams.set('tm_run', String(runId || ''));
+    u.searchParams.set('tm_order', String(order || ''));
+    u.searchParams.set('tm_hop', String(hop || 0));
+    u.searchParams.set('tm_return', String(returnUrl || ''));
+    return u.toString();
+  }
+
+  function withParam(urlStr, key, val) {
+    try {
+      const u = new URL(urlStr);
+      u.searchParams.set(key, String(val));
+      return u.toString();
+    } catch {
+      return urlStr;
+    }
+  }
+
+  // =============================== POPUP SUPPRESSOR ===============================
+  function installPopupSuppressor(ctx) {
+    const patched = new WeakSet();
+    let intervalId = null;
+    let lastEmitAt = 0;
+
+    function emitPopup(type, msg) {
+      const t = now();
+      if (t - lastEmitAt < 1500) return;
+      lastEmitAt = t;
+      emitProgress({
+        type,
+        runId: ctx.runId,
+        order: ctx.order,
+        message: String(msg || ''),
+        tabId
+      }).catch(() => {});
+    }
+
+    function patchWin(w, origin = '') {
+      if (!w || patched.has(w)) return;
+      patched.add(w);
+
+      try {
+        Object.defineProperty(w, 'alert', {
+          configurable: true,
+          writable: true,
+          value: function (msg) {
+            emitPopup('ALERT_SUPPRESSED', `${origin}${msg || ''}`);
+            return undefined;
+          }
+        });
+      } catch {}
+
+      try {
+        Object.defineProperty(w, 'confirm', {
+          configurable: true,
+          writable: true,
+          value: function (msg) {
+            emitPopup('CONFIRM_SUPPRESSED_TRUE', `${origin}${msg || ''}`);
+            return true;
+          }
+        });
+      } catch {}
+
+      try {
+        Object.defineProperty(w, 'prompt', {
+          configurable: true,
+          writable: true,
+          value: function (msg, defVal = '') {
+            emitPopup('PROMPT_SUPPRESSED_DEFAULT', `${origin}${msg || ''}`);
+            return defVal ?? '';
+          }
+        });
+      } catch {}
+    }
+
+    function crawl(root = window.top, prefix = '') {
+      try { patchWin(root, prefix); } catch {}
+
+      let n = 0;
+      try { n = root.frames.length; } catch { n = 0; }
+
+      for (let i = 0; i < n; i++) {
+        try {
+          const child = root.frames[i];
+          patchWin(child, `${prefix}f${i}: `);
+          crawl(child, `${prefix}f${i}>`);
+        } catch {}
+      }
+    }
+
+    try { crawl(window.top, ''); } catch {}
+    intervalId = setInterval(() => {
+      try { crawl(window.top, ''); } catch {}
+    }, 500);
+
+    return function uninstall() {
+      if (intervalId) clearInterval(intervalId);
+      intervalId = null;
+    };
+  }
+
+  // =============================== IRIS SELECTION ===============================
+  function chooseFirstNonEmpty(selectEl) {
+    const opts = Array.from(selectEl.options || []);
+    return opts.find(o =>
+      String(o.value || '').trim() !== '' &&
+      !/^[-\s]+$/.test(String(o.textContent || '').trim())
+    ) || null;
+  }
+
+  function pickOption(selectEl, want, textStarts) {
+    if (!selectEl) return { ok: false, fallback: false, value: '', text: '' };
+
+    const opts = Array.from(selectEl.options || []);
+    const wantU = String(want || '').trim().toUpperCase();
+    const prefU = String(textStarts || '').trim().toUpperCase();
+
+    let opt =
+      opts.find(o => String(o.value || '').trim().toUpperCase() === wantU) ||
+      opts.find(o => String(o.value || '').trim().toUpperCase().startsWith(wantU)) ||
+      opts.find(o => String(o.textContent || '').trim().toUpperCase().startsWith(prefU));
+
+    let fallback = false;
+    if (!opt) {
+      opt = chooseFirstNonEmpty(selectEl);
+      fallback = true;
+    }
+    if (!opt) return { ok: false, fallback: false, value: '', text: '' };
+
+    selectEl.value = opt.value;
+    selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+    selectEl.dispatchEvent(new Event('input', { bubbles: true }));
+    selectEl.dispatchEvent(new Event('blur', { bubbles: true }));
+
+    return {
+      ok: true,
+      fallback,
+      value: String(opt.value || ''),
+      text: String(opt.textContent || '').trim(),
+    };
+  }
+
+  function clickBlank(doc) {
+    try {
+      const fs = doc.getElementById('tbl_iris') || doc.body;
+      fs.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: doc.defaultView }));
+    } catch {}
+  }
+
+  async function ensureIrisOpenOrPermission() {
+    const t0 = now();
+    while (now() - t0 < 120000) {
+      if (permissionErrorDetectedDeep()) return { permission: true };
+
+      const already = findByIdDeep('tbl_iris');
+      if (already && isVisible(already.el, already.doc) && already.el.style.display !== 'none') {
+        return { ok: true, fs: already };
+      }
+
+      const btn = findByIdDeep('btn_iriscodes');
+      if (btn) {
+        try { btn.el.click(); } catch {}
+        try {
+          if (typeof btn.win.showiris === 'function') btn.win.showiris();
+        } catch {}
+      }
+
+      await sleep(250);
+    }
+
+    return { ok: false };
+  }
+
+  async function touchWorkdescription(ctx) {
+    const found = await waitFor(() => findByIdDeep('workdescription'), 60000, 250);
+    if (!found || !found.el || found.el.tagName !== 'TEXTAREA') {
+      await emitProgress({
+        type: 'WORKDESC_SKIP',
+        runId: ctx.runId,
+        order: ctx.order,
+        message: 'workdescription textarea not found',
+        tabId
+      });
+      return false;
+    }
+
+    const ta = found.el;
+    const zws = CFG.WORKDESC_ZWS;
+    const before = String(ta.value || '');
+
+    try { ta.focus(); } catch {}
+
+    if (!before.includes(zws)) {
+      ta.value = before + zws;
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      ta.dispatchEvent(new Event('change', { bubbles: true }));
+
+      try {
+        if (typeof found.win.appendeditedfield === 'function') {
+          found.win.appendeditedfield('workdescription', false);
+        }
+      } catch {}
+
+      try { ta.blur(); } catch {}
+
+      await emitProgress({
+        type: 'WORKDESC_TOUCHED',
+        runId: ctx.runId,
+        order: ctx.order,
+        message: 'Zero-width space added to workdescription',
+        tabId
+      });
+      return true;
+    }
+
+    await emitProgress({
+      type: 'WORKDESC_ALREADY',
+      runId: ctx.runId,
+      order: ctx.order,
+      message: 'workdescription already contains zero-width space',
+      tabId
+    });
+    return true;
+  }
+
+  async function runStepWithRetry(ctx, step, idx, total) {
+    const maxRetries = 5;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      if (permissionErrorDetectedDeep()) return { permission: true };
+
+      const sel = await waitFor(() => {
+        const x = findByIdDeep(step.id);
+        if (x && x.el && x.el.tagName === 'SELECT') return x;
+        return null;
+      }, 45000, 200);
+
+      if (!sel) {
+        await emitProgress({
+          type: 'STEP_RETRY',
+          runId: ctx.runId,
+          order: ctx.order,
+          stepIndex: idx,
+          stepTotal: total,
+          message: `${step.label}: select not found (${attempt}/${maxRetries})`,
+          tabId
+        });
+        continue;
+      }
+
+      const res = pickOption(sel.el, step.want, step.textStarts);
+      clickBlank(sel.doc);
+
+      if (!res.ok) {
+        await emitProgress({
+          type: 'STEP_RETRY',
+          runId: ctx.runId,
+          order: ctx.order,
+          stepIndex: idx,
+          stepTotal: total,
+          message: `${step.label}: pick failed (${attempt}/${maxRetries})`,
+          tabId
+        });
+        await sleep(1200);
+        continue;
+      }
+
+      await sleep(800);
+      const stable = String(sel.el.value || '') === String(res.value);
+      if (!stable) {
+        await emitProgress({
+          type: 'STEP_RETRY',
+          runId: ctx.runId,
+          order: ctx.order,
+          stepIndex: idx,
+          stepTotal: total,
+          message: `${step.label}: value reverted (${attempt}/${maxRetries})`,
+          tabId
+        });
+        await sleep(1500);
+        continue;
+      }
+
+      await emitProgress({
+        type: 'STEP_DONE',
+        runId: ctx.runId,
+        order: ctx.order,
+        stepIndex: idx,
+        stepTotal: total,
+        fallback: res.fallback,
+        pickedValue: res.value,
+        message: `${step.label} -> ${res.value}${res.fallback ? ' (fallback)' : ' (exact)'}`,
+        tabId
+      });
+
+      return { ok: true };
+    }
+
+    return { ok: false };
+  }
+
+  async function countdown(ctx, ms, label) {
+    let left = Math.ceil(ms / 1000);
+    const initial = left;
+    while (left > 0) {
+      if (permissionErrorDetectedDeep()) return { permission: true };
+
+      if (left === initial || left % 30 === 0 || left <= 10) {
+        await emitProgress({
+          type: 'COUNTDOWN',
+          runId: ctx.runId,
+          order: ctx.order,
+          leftSec: left,
+          message: `${label}: ${fmtSec(left)}`,
+          tabId
+        });
+      }
+      await sleep(1000);
+      left--;
+    }
+    return { ok: true };
+  }
+
+  // =============================== PERMISSION FIX HOP PAGE ===============================
+  async function runPermissionFixHopIfNeeded() {
+    if (!isGroupwiseRoot) return false;
+    if (qs.get('tm_perm_fix') !== '1') return false;
+    if (!isTopWindow()) return false;
+
+    const runId = qs.get('tm_run') || '';
+    const order = qs.get('tm_order') || '';
+    const hop = parseInt(qs.get('tm_hop') || '0', 10);
+    const ret = qs.get('tm_return') || '';
+
+    const ctx = { runId, order };
+
+    const uninstallPopupSuppressor = installPopupSuppressor(ctx);
+    let hb = null;
+    try {
+      await emitProgress({
+        type: 'PERM_FIX_ENTER',
+        runId,
+        order,
+        message: `Permission fix hop page opened (hop=${hop})`,
+        tabId
+      });
+
+      hb = setInterval(() => {
+        emitHeartbeat({
+          type: 'HEARTBEAT',
+          runId,
+          order,
+          stage: 'perm_fix_hop',
+          tabId
+        }).catch(() => {});
+      }, CFG.HEARTBEAT_INTERVAL_MS);
+
+      if (!ret) {
+        await emitResult({
+          type: 'RESULT',
+          status: 'error',
+          runId,
+          order,
+          message: 'tm_return missing on permission fix hop',
+          durationMs: 0,
+          tabId
+        });
+        safeCloseTab();
+        return true;
+      }
+
+      await sleep(CFG.PERM_FIX_WAIT_MS);
+
+      await emitProgress({
+        type: 'PERM_FIX_RETURN',
+        runId,
+        order,
+        message: 'Returning to order page after permission fix hop',
+        tabId
+      });
+
+      location.replace(ret);
+      return true;
+    } finally {
+      if (hb) clearInterval(hb);
+      try { uninstallPopupSuppressor && uninstallPopupSuppressor(); } catch {}
+    }
+  }
+
+  // =============================== GROUPWISE CHILD ===============================
+  async function runGroupwiseChild() {
+    if (!isGroupwiseViewTab) return;
+    if (qs.get('tm_iris_auto') !== '1') return;
+    if (!isTopWindow()) return;
+
+    if (window.__CE_IRIS_CHILD_ACTIVE__) return;
+    window.__CE_IRIS_CHILD_ACTIVE__ = true;
+
+    const ctx = {
+      runId: qs.get('tm_run') || `run-${now()}`,
+      order: qs.get('item_id') || '',
+      attempt: parseInt(qs.get('tm_attempt') || '1', 10),
+      permHop: parseInt(qs.get('tm_perm_hop') || '0', 10),
+      startedAt: now(),
+    };
+
+    // anti reload storm
+    const reloadKey = `ce_iris_reload_guard_${ctx.runId}_${ctx.order}`;
+    try {
+      const raw = sessionStorage.getItem(reloadKey);
+      let arr = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(arr)) arr = [];
+      const t = now();
+      arr = arr.filter(x => t - Number(x) < 25000);
+      arr.push(t);
+      sessionStorage.setItem(reloadKey, JSON.stringify(arr));
+
+      if (arr.length >= 4) {
+        await emitResult({
+          type: 'RESULT',
+          status: 'error',
+          runId: ctx.runId,
+          order: ctx.order,
+          message: 'Reload storm detected in child tab',
+          durationMs: now() - ctx.startedAt,
+          tabId
+        });
+        safeCloseTab();
+        return;
+      }
+    } catch {}
+
+    const uninstallPopupSuppressor = installPopupSuppressor(ctx);
+
+    let stage = 'init';
+    const hbTimer = setInterval(() => {
+      emitHeartbeat({
+        type: 'HEARTBEAT',
+        runId: ctx.runId,
+        order: ctx.order,
+        stage,
+        tabId
+      }).catch(() => {});
+    }, CFG.HEARTBEAT_INTERVAL_MS);
+
+    async function handlePermissionHop(reason) {
+      const hop = Number.isFinite(ctx.permHop) ? ctx.permHop : 0;
+
+      await emitProgress({
+        type: 'PERMISSION_DETECTED',
+        runId: ctx.runId,
+        order: ctx.order,
+        message: `${reason}. hop=${hop}/${CFG.MAX_PERMISSION_HOPS}`,
+        tabId
+      });
+
+      if (hop >= CFG.MAX_PERMISSION_HOPS) {
+        await emitResult({
+          type: 'RESULT',
+          status: 'error',
+          runId: ctx.runId,
+          order: ctx.order,
+          message: `Permission loop limit reached (${hop})`,
+          durationMs: now() - ctx.startedAt,
+          tabId
+        });
+        safeCloseTab();
+        return;
+      }
+
+      let ret = location.href;
+      ret = withParam(ret, 'tm_perm_hop', hop + 1);
+
+      const fixUrl = buildPermFixUrl(ret, ctx.runId, ctx.order, hop + 1);
+
+      await emitProgress({
+        type: 'PERMISSION_REDIRECT',
+        runId: ctx.runId,
+        order: ctx.order,
+        message: `Redirect to root for session refresh, then back to order`,
+        tabId
+      });
+
+      location.replace(fixUrl);
+    }
+
+    try {
+      stage = 'start';
+      log(`[CHILD] start order=${ctx.order}, attempt=${ctx.attempt}, run=${ctx.runId}, permHop=${ctx.permHop}`);
+      await emitProgress({
+        type: 'CHILD_START',
+        runId: ctx.runId,
+        order: ctx.order,
+        message: `Child started (attempt ${ctx.attempt}, permHop ${ctx.permHop})`,
+        tabId
+      });
+
+      if (permissionErrorDetectedDeep()) {
+        stage = 'permission_detected_early';
+        await handlePermissionHop('Permission page detected at start');
+        return;
+      }
+
+      stage = 'workdesc_touch';
+      await touchWorkdescription(ctx);
+
+      stage = 'open_iris';
+      const open = await ensureIrisOpenOrPermission();
+      if (open?.permission) {
+        stage = 'permission_detected_on_open';
+        await handlePermissionHop('Permission page detected while opening IRIS');
+        return;
+      }
+      if (!open?.ok) throw new Error('Не удалось открыть Iriscodes');
+
+      await emitProgress({
+        type: 'IRIS_OPENED',
+        runId: ctx.runId,
+        order: ctx.order,
+        message: 'Iris fieldset opened',
+        tabId
+      });
+
+      for (let i = 0; i < IRIS_STEPS.length; i++) {
+        const step = IRIS_STEPS[i];
+
+        if (i > 0) {
+          stage = `delay_${i + 1}`;
+          const d = randInt(CFG.STEP_DELAY_MIN_MS, CFG.STEP_DELAY_MAX_MS);
+          const c = await countdown(ctx, d, `Wait before step ${i + 1}/${IRIS_STEPS.length}`);
+          if (c?.permission) {
+            stage = 'permission_detected_on_countdown';
+            await handlePermissionHop('Permission page detected during countdown');
+            return;
+          }
+        }
+
+        stage = `step_${i + 1}`;
+        const st = await runStepWithRetry(ctx, step, i, IRIS_STEPS.length);
+        if (st?.permission) {
+          stage = 'permission_detected_on_step';
+          await handlePermissionHop(`Permission page detected on step ${i + 1}`);
+          return;
+        }
+        if (!st?.ok) throw new Error(`Step failed after retries: ${step.label}`);
+      }
+
+      stage = 'workdesc_touch_final';
+      await touchWorkdescription(ctx);
+
+      stage = 'done';
+      await emitResult({
+        type: 'RESULT',
+        status: 'done',
+        runId: ctx.runId,
+        order: ctx.order,
+        message: 'IRIS completed 5/5',
+        durationMs: now() - ctx.startedAt,
+        tabId
+      });
+
+      log(`[CHILD] done order=${ctx.order}`);
+      await sleep(1200);
+      safeCloseTab();
+
+    } catch (err) {
+      const msg = String(err?.message || err || 'Unknown child error');
+      await emitResult({
+        type: 'RESULT',
+        status: 'error',
+        runId: ctx.runId,
+        order: ctx.order,
+        message: msg,
+        durationMs: now() - ctx.startedAt,
+        tabId
+      });
+
+      log(`[CHILD] error order=${ctx.order}:`, msg);
+      await sleep(1500);
+      safeCloseTab();
+
+    } finally {
+      clearInterval(hbTimer);
+      try { uninstallPopupSuppressor && uninstallPopupSuppressor(); } catch {}
+    }
+  }
+
+  // =============================== DASHBOARD ===============================
+  async function runDashboard() {
+    if (document.readyState === 'loading') {
+      await new Promise(res => document.addEventListener('DOMContentLoaded', res, { once: true }));
+    }
+
+    const state = {
+      running: false,
+      stopRequested: false,
+      runId: '',
+      currentOrder: '',
+      currentAttempt: 1,
+      currentTabHandle: null,
+      clickedMap: await gmGet(KEY.CLICKED_MAP, {}),
+      autoEnabled: await gmGet(KEY.AUTO_ENABLED, CFG.SCHEDULE_ENABLED_DEFAULT),
+      skipTop: await gmGet(KEY.SKIP_TOP, 0),
+      progressListenerId: null,
+      lastMsg: 'Idle',
+      ui: null,
+      schedulerIv: null,
+      highlightIv: null,
+      mo: null,
+    };
+
+    if (!state.clickedMap || typeof state.clickedMap !== 'object' || Array.isArray(state.clickedMap)) {
+      state.clickedMap = {};
+    }
+    state.skipTop = Math.max(0, parseInt(state.skipTop || 0, 10) || 0);
+
+    function decodeReport() {
+      const rep = new URLSearchParams(location.search).get('report') || '';
+      try { return decodeURIComponent(rep).replace(/\+/g, ' '); } catch { return rep; }
+    }
+
+    function isAudioPage() {
+      const r = decodeReport();
+      if (/audio\s*-\s*screening/i.test(r)) return true;
+      const h2 = document.querySelector('h2');
+      const t = (h2?.textContent || '').toLowerCase();
+      return t.includes('audio') && t.includes('screen');
+    }
+
+    function orderCells() {
+      return Array.from(document.querySelectorAll('tbody tr td:first-child'))
+        .filter(td => /^\d+$/.test((td.textContent || '').trim()));
+    }
+
+    function visibleOrdersUnique() {
+      const arr = orderCells().map(td => (td.textContent || '').trim());
+      return Array.from(new Set(arr));
+    }
+
+    function nextUnclickedOrder() {
+      const arr = visibleOrdersUnique();
+      const skip = Math.max(0, parseInt(state.skipTop || 0, 10) || 0);
+      const sliced = arr.slice(skip);
+      for (const ord of sliced) {
+        if (!state.clickedMap[String(ord)]) return String(ord);
+      }
+      return null;
+    }
+
+    async function persistClicked() {
+      await gmSet(KEY.CLICKED_MAP, state.clickedMap);
+    }
+
+    async function persistSkipTop() {
+      await gmSet(KEY.SKIP_TOP, state.skipTop);
+    }
+
+    function mark(order, status, extra = {}) {
+      const key = String(order);
+      const prev = state.clickedMap[key] || { order: key, createdAt: now() };
+      state.clickedMap[key] = {
+        ...prev,
+        status,
+        updatedAt: now(),
+        ...extra
+      };
+      persistClicked().catch(() => {});
+      renderUI();
+    }
+
+    function applyHighlights() {
+      for (const td of orderCells()) {
+        const ord = (td.textContent || '').trim();
+        const rec = state.clickedMap[ord];
+        if (rec) {
+          td.style.setProperty('background-color', CFG.HIGHLIGHT_BG, 'important');
+          td.style.setProperty('color', CFG.HIGHLIGHT_COLOR, 'important');
+          td.style.setProperty('font-weight', '700', 'important');
+          td.title = `${ord} | ${rec.status || 'clicked'}`;
+          td.dataset.ceHighlighted = '1';
+        } else if (td.dataset.ceHighlighted === '1') {
+          td.style.removeProperty('background-color');
+          td.style.removeProperty('color');
+          td.style.removeProperty('font-weight');
+          td.removeAttribute('title');
+          td.dataset.ceHighlighted = '0';
+        }
+      }
+    }
+
+    function counts() {
+      const vals = Object.values(state.clickedMap);
+      return {
+        total: vals.length,
+        done: vals.filter(x => x.status === 'done').length,
+        error: vals.filter(x => x.status === 'error').length,
+        timeout: vals.filter(x => x.status === 'timeout').length,
+        opened: vals.filter(x => x.status === 'opened').length,
+      };
+    }
+
+    function buildGroupwiseUrl(order, runId, attempt) {
+      const base = 'https://groupwise.cerepair.nl/webos_net/viewtab.ashx';
+      const p = new URLSearchParams({
+        name: 'reparatie',
+        item_id: String(order),
+        tm_iris_auto: '1',
+        tm_run: String(runId),
+        tm_attempt: String(attempt || 1),
+        tm_perm_hop: '0',
+      });
+      return `${base}?${p.toString()}`;
+    }
+
+    async function closeCurrentTab() {
+      try {
+        if (state.currentTabHandle && typeof state.currentTabHandle.close === 'function') {
+          state.currentTabHandle.close();
+        }
+      } catch {}
+      state.currentTabHandle = null;
+    }
+
+    function setMsg(msg) {
+      state.lastMsg = msg;
+      renderUI();
+      log(msg);
+    }
+
+    async function setDashState(extra = {}) {
+      await gmSet(KEY.DASH_STATE, {
+        running: state.running,
+        stopRequested: state.stopRequested,
+        runId: state.runId,
+        currentOrder: state.currentOrder,
+        currentAttempt: state.currentAttempt,
+        autoEnabled: state.autoEnabled,
+        skipTop: state.skipTop,
+        ts: now(),
+        ...extra
+      });
+    }
+
+    function ensureProgressListener() {
+      if (state.progressListenerId !== null) return;
+      state.progressListenerId = GM_addValueChangeListener(KEY.EVENT_PROGRESS, (_k, _o, n) => {
+        if (!n || typeof n !== 'object') return;
+        if (!state.running) return;
+        if (n.runId !== state.runId) return;
+        if (String(n.order || '') !== String(state.currentOrder || '')) return;
+
+        const t = n.type || 'PROGRESS';
+        const left = typeof n.leftSec === 'number' ? ` | left=${n.leftSec}s` : '';
+        const msg = n.message ? ` | ${n.message}` : '';
+        state.lastMsg = `[CHILD:${t}] order=${n.order}${left}${msg}`;
+        renderUI();
+      });
+    }
+
+    async function waitChildOutcome(runId, order, timeoutMs, maxSilentMs) {
+      return new Promise((resolve) => {
+        let done = false;
+        let lRes = null;
+        let lHb = null;
+        let timer = null;
+        let iv = null;
+
+        const startTs = now();
+        let heartbeatSeen = false;
+        let lastHeartbeat = 0;
+
+        const finish = (payload) => {
+          if (done) return;
+          done = true;
+          try { if (lRes !== null) GM_removeValueChangeListener(lRes); } catch {}
+          try { if (lHb !== null) GM_removeValueChangeListener(lHb); } catch {}
+          if (timer) clearTimeout(timer);
+          if (iv) clearInterval(iv);
+          resolve(payload);
+        };
+
+        lRes = GM_addValueChangeListener(KEY.EVENT_RESULT, (_k, _o, n) => {
+          if (!n || typeof n !== 'object') return;
+          if (n.runId !== runId) return;
+          if (String(n.order) !== String(order)) return;
+          finish({ kind: 'result', data: n });
+        });
+
+        lHb = GM_addValueChangeListener(KEY.EVENT_HEARTBEAT, (_k, _o, n) => {
+          if (!n || typeof n !== 'object') return;
+          if (n.runId !== runId) return;
+          if (String(n.order) !== String(order)) return;
+          heartbeatSeen = true;
+          lastHeartbeat = now();
+        });
+
+        iv = setInterval(() => {
+          const elapsed = now() - startTs;
+          if (heartbeatSeen && (now() - lastHeartbeat > maxSilentMs)) {
+            finish({ kind: 'silent', message: `Heartbeat silent > ${Math.round(maxSilentMs / 1000)}s` });
+            return;
+          }
+          if (!heartbeatSeen && elapsed > 180000) {
+            finish({ kind: 'no_heartbeat', message: 'No heartbeat in first 180s' });
+          }
+        }, 2000);
+
+        timer = setTimeout(() => {
+          finish({ kind: 'timeout', message: 'Order total timeout' });
+        }, timeoutMs);
+      });
+    }
+
+    async function processOrder(order) {
+      state.currentOrder = String(order);
+      state.currentAttempt = 1;
+      renderUI();
+
+      for (let attempt = 1; attempt <= CFG.MAX_ATTEMPTS_PER_ORDER; attempt++) {
+        if (state.stopRequested) return;
+        state.currentAttempt = attempt;
+
+        mark(order, 'opened', { runId: state.runId, attempt });
+        const url = buildGroupwiseUrl(order, state.runId, attempt);
+
+        setMsg(`[1/3] Open Groupwise order=${order} attempt=${attempt}/${CFG.MAX_ATTEMPTS_PER_ORDER}`);
+
+        try {
+          state.currentTabHandle = GM_openInTab(url, {
+            active: CFG.OPEN_TAB_ACTIVE,
+            insert: true,
+            setParent: true
+          });
+        } catch (e) {
+          mark(order, 'error', { attempt, error: `GM_openInTab failed: ${String(e)}` });
+          return;
+        }
+
+        setMsg(`[2/3] Wait child result order=${order} (watchdog ON)`);
+
+        const outcome = await waitChildOutcome(
+          state.runId,
+          order,
+          CFG.ORDER_TOTAL_TIMEOUT_MS,
+          CFG.HEARTBEAT_SILENT_MS
+        );
+
+        await closeCurrentTab();
+
+        if (!outcome) {
+          if (attempt < CFG.MAX_ATTEMPTS_PER_ORDER) {
+            setMsg(`⚠ unknown outcome, retry order=${order}`);
+            await sleep(1200);
+            continue;
+          }
+          mark(order, 'error', { attempt, error: 'unknown outcome' });
+          return;
+        }
+
+        if (outcome.kind === 'result') {
+          const r = outcome.data || {};
+          if (r.status === 'done') {
+            mark(order, 'done', {
+              runId: state.runId,
+              attempt,
+              durationMs: r.durationMs || 0
+            });
+            setMsg(`✅ done order=${order} (${Math.round((r.durationMs || 0) / 1000)}s)`);
+            return;
+          }
+
+          if (attempt < CFG.MAX_ATTEMPTS_PER_ORDER) {
+            setMsg(`⚠ child error order=${order}: ${r.message || 'unknown'} | retry...`);
+            await sleep(1300);
+            continue;
+          }
+
+          mark(order, 'error', {
+            runId: state.runId,
+            attempt,
+            error: r.message || 'child error'
+          });
+          return;
+        }
+
+        if (outcome.kind === 'silent' || outcome.kind === 'no_heartbeat' || outcome.kind === 'timeout') {
+          if (attempt < CFG.MAX_ATTEMPTS_PER_ORDER) {
+            setMsg(`⚠ ${outcome.kind} order=${order} | retry...`);
+            await sleep(1300);
+            continue;
+          }
+          const status = outcome.kind === 'timeout' ? 'timeout' : 'error';
+          mark(order, status, {
+            runId: state.runId,
+            attempt,
+            error: outcome.message || outcome.kind
+          });
+          return;
+        }
+      }
+    }
+
+    async function startRunner(source = 'manual') {
+      if (state.running) return;
+      if (!isAudioPage()) {
+        setMsg('Открой страницу Audio - Screening (report=Audio - Screening).');
+        return;
+      }
+
+      state.running = true;
+      state.stopRequested = false;
+      state.runId = `run-${now()}-${Math.random().toString(36).slice(2, 7)}`;
+      state.currentOrder = '';
+      state.currentAttempt = 1;
+
+      ensureProgressListener();
+      renderUI();
+      await setDashState({ stage: 'start', source });
+      setMsg(`RUN started (${source}) runId=${state.runId}`);
+
+      while (state.running && !state.stopRequested) {
+        if (!isAudioPage()) {
+          setMsg('Жду возврат на Audio - Screening...');
+          await sleep(2500);
+          continue;
+        }
+
+        const next = nextUnclickedOrder();
+        if (!next) {
+          setMsg(`Новых не-кликнутых заказов нет (skip top = ${state.skipTop}). Жду...`);
+          await sleep(CFG.NO_ORDERS_POLL_MS);
+          continue;
+        }
+
+        await processOrder(next);
+        if (state.stopRequested) break;
+
+        state.currentOrder = '';
+        state.currentAttempt = 1;
+        applyHighlights();
+        renderUI();
+
+        setMsg('[3/3] Переход к следующему заказу...');
+        await sleep(CFG.NEXT_ORDER_DELAY_MS);
+      }
+
+      state.running = false;
+      state.stopRequested = false;
+      state.currentOrder = '';
+      state.currentAttempt = 1;
+      renderUI();
+      await setDashState({ stage: 'stopped' });
+      setMsg('RUN stopped');
+    }
+
+    async function stopRunner(reason = 'manual') {
+      if (!state.running) return;
+      state.stopRequested = true;
+      setMsg(`Stop requested (${reason})...`);
+      await closeCurrentTab();
+      await setDashState({ stage: 'stop_requested', reason });
+      renderUI();
+    }
+
+    function buildUI() {
+      const panel = document.createElement('div');
+      panel.id = 'ce-iris-panel-v130';
+      panel.style.cssText = `
+        position: fixed;
+        right: 12px;
+        bottom: 12px;
+        z-index: 999999;
+        width: 430px;
+        max-height: 75vh;
+        overflow: hidden;
+        border-radius: 12px;
+        border: 1px solid #334155;
+        background: #0f172a;
+        color: #e2e8f0;
+        box-shadow: 0 8px 24px rgba(0,0,0,.35);
+        font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      `;
+
+      panel.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;border-bottom:1px solid #1f2937;">
+          <strong>Audio IRIS Runner v1.3.0</strong>
+          <span id="ce-dot" style="width:9px;height:9px;border-radius:50%;background:#64748b;"></span>
+        </div>
+
+        <div style="padding:10px;display:flex;gap:6px;flex-wrap:wrap;">
+          <button id="ce-start" style="padding:4px 8px;border:1px solid #166534;background:#16a34a;color:#fff;border-radius:6px;cursor:pointer;">Start</button>
+          <button id="ce-stop" style="padding:4px 8px;border:1px solid #991b1b;background:#dc2626;color:#fff;border-radius:6px;cursor:pointer;">Stop</button>
+          <button id="ce-auto" style="padding:4px 8px;border:1px solid #1e3a8a;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;">Auto: OFF</button>
+          <button id="ce-reset" style="padding:4px 8px;border:1px solid #92400e;background:#f59e0b;color:#111;border-radius:6px;cursor:pointer;">Reset clicked</button>
+        </div>
+
+        <div style="padding:0 10px 8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span style="color:#93c5fd;">Skip top N:</span>
+          <input id="ce-skip" type="number" min="0" step="1" value="0"
+                 style="width:90px;padding:3px 6px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;">
+          <button id="ce-apply-skip"
+                  style="padding:4px 8px;border:1px solid #334155;background:#1e293b;color:#fff;border-radius:6px;cursor:pointer;">
+            Apply
+          </button>
+        </div>
+
+        <div id="ce-info" style="white-space:pre-line;padding:0 10px 10px;color:#cbd5e1;"></div>
+        <div style="padding:0 10px 8px;color:#93c5fd;">Schedule (AMS): Mon-Fri ${CFG.SCHEDULE_START}-${CFG.SCHEDULE_END}</div>
+
+        <div style="padding:0 10px 10px;">
+          <div style="margin-bottom:4px;color:#93c5fd;">Clicked list (latest 15)</div>
+          <div id="ce-list" style="max-height:170px;overflow:auto;border:1px solid #1f2937;border-radius:8px;padding:6px;background:#020617;"></div>
+        </div>
+      `;
+
+      document.body.appendChild(panel);
+
+      const ui = {
+        panel,
+        dot: panel.querySelector('#ce-dot'),
+        info: panel.querySelector('#ce-info'),
+        list: panel.querySelector('#ce-list'),
+        btnStart: panel.querySelector('#ce-start'),
+        btnStop: panel.querySelector('#ce-stop'),
+        btnAuto: panel.querySelector('#ce-auto'),
+        btnReset: panel.querySelector('#ce-reset'),
+        inpSkip: panel.querySelector('#ce-skip'),
+        btnApplySkip: panel.querySelector('#ce-apply-skip'),
+      };
+
+      ui.btnStart.addEventListener('click', () => startRunner('manual').catch(e => log('start err', e)));
+      ui.btnStop.addEventListener('click', () => stopRunner('manual').catch(e => log('stop err', e)));
+      ui.btnAuto.addEventListener('click', async () => {
+        state.autoEnabled = !state.autoEnabled;
+        await gmSet(KEY.AUTO_ENABLED, state.autoEnabled);
+        renderUI();
+
+        if (state.autoEnabled) {
+          setMsg('Auto mode enabled');
+          if (inScheduleWindow() && !state.running) {
+            startRunner('auto').catch(e => log('auto start err', e));
+          }
+        } else {
+          setMsg('Auto mode disabled');
+        }
+      });
+
+      ui.btnReset.addEventListener('click', async () => {
+        if (!confirm('Очистить список clicked заказов?')) return;
+        state.clickedMap = {};
+        await persistClicked();
+        applyHighlights();
+        renderUI();
+        setMsg('Clicked list cleared');
+      });
+
+      ui.btnApplySkip.addEventListener('click', async () => {
+        const v = Math.max(0, parseInt(ui.inpSkip.value || '0', 10) || 0);
+        state.skipTop = v;
+        ui.inpSkip.value = String(v);
+        await persistSkipTop();
+        renderUI();
+        setMsg(`Skip top set to ${v}`);
+      });
+
+      ui.inpSkip.addEventListener('keydown', async (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          ui.btnApplySkip.click();
+        }
+      });
+
+      window.addEventListener('keydown', (e) => {
+        if (e.altKey && e.shiftKey && e.code === 'KeyT') {
+          e.preventDefault();
+          if (state.running) stopRunner('hotkey').catch(() => {});
+          else startRunner('hotkey').catch(() => {});
+        }
+      });
+
+      return ui;
+    }
+
+    function renderUI() {
+      if (!state.ui) return;
+
+      const c = counts();
+      const mode = state.running ? 'RUNNING' : 'IDLE';
+      const sch = inScheduleWindow() ? 'IN schedule' : 'OUT of schedule';
+
+      state.ui.dot.style.background = state.running ? '#22c55e' : '#64748b';
+      state.ui.btnAuto.textContent = `Auto: ${state.autoEnabled ? 'ON' : 'OFF'}`;
+      state.ui.btnAuto.style.background = state.autoEnabled ? '#16a34a' : '#2563eb';
+      state.ui.inpSkip.value = String(state.skipTop);
+
+      state.ui.info.textContent =
+        `Mode: ${mode}\n` +
+        `RunID: ${state.runId || '-'}\n` +
+        `Current: ${state.currentOrder || '-'} (attempt ${state.currentAttempt || 1}/${CFG.MAX_ATTEMPTS_PER_ORDER})\n` +
+        `Skip top: ${state.skipTop}\n` +
+        `Clicked: ${c.total} | done:${c.done} error:${c.error} timeout:${c.timeout} opened:${c.opened}\n` +
+        `Schedule now: ${sch}\n` +
+        `Last: ${state.lastMsg}`;
+
+      const recent = Object.values(state.clickedMap)
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+        .slice(0, 15);
+
+      if (!recent.length) {
+        state.ui.list.textContent = '(empty)';
+      } else {
+        state.ui.list.innerHTML = recent.map(x => {
+          const t = new Date(x.updatedAt || x.createdAt || now()).toLocaleString();
+          return `<div style="padding:2px 0;border-bottom:1px solid #111827;">
+            <span style="display:inline-block;min-width:90px;color:#facc15;font-weight:700;">${x.order}</span>
+            <span>${x.status || '-'}</span>
+            <span style="color:#64748b;"> | a:${x.attempt || 1} | ${t}</span>
+          </div>`;
+        }).join('');
+      }
+    }
+
+    // init UI
+    state.ui = buildUI();
+    renderUI();
+    applyHighlights();
+
+    state.highlightIv = setInterval(() => {
+      try { applyHighlights(); } catch {}
+    }, 1200);
+
+    try {
+      state.mo = new MutationObserver(() => applyHighlights());
+      state.mo.observe(document.documentElement, { subtree: true, childList: true });
+    } catch {}
+
+    state.schedulerIv = setInterval(() => {
+      if (!state.autoEnabled) return;
+      const inside = inScheduleWindow();
+      if (inside && !state.running) {
+        startRunner('auto').catch(e => log('scheduler start err', e));
+      } else if (!inside && state.running) {
+        stopRunner('auto_out_of_window').catch(e => log('scheduler stop err', e));
+      }
+    }, CFG.SCHEDULE_CHECK_MS);
+
+    if (state.autoEnabled && inScheduleWindow() && !state.running) {
+      startRunner('auto').catch(e => log('initial auto start err', e));
+    }
+
+    setMsg('Dashboard manager ready. Alt+Shift+T = Start/Stop.');
+  }
+
+  // =============================== BOOT ===============================
+  (async () => {
+    // 1) Если это спец-hop на корень groupwise — обработать и выйти
+    if (isGroupwise) {
+      const handled = await runPermissionFixHopIfNeeded();
+      if (handled) return;
+    }
+
+    // 2) Обычный child на viewtab
+    if (isGroupwise) {
+      runGroupwiseChild().catch(e => log('[CHILD] fatal', e));
+    }
+
+    // 3) Dashboard manager
+    if (isDashboard) {
+      runDashboard().catch(e => log('[DASH] fatal', e));
+    }
+  })();
+
+})();
