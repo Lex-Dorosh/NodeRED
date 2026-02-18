@@ -9,10 +9,10 @@
 // @grant        none
 //
 // Optional (recommended for GitHub auto-updates):
-// @homepageURL  https://github.com/<YOUR_GH_USER>/<YOUR_REPO>
-// @supportURL   https://github.com/<YOUR_GH_USER>/<YOUR_REPO>/issues
-// @downloadURL  https://raw.githubusercontent.com/<YOUR_GH_USER>/<YOUR_REPO>/main/gxo-groupwise-close-order-claiming.user.js
-// @updateURL    https://raw.githubusercontent.com/<YOUR_GH_USER>/<YOUR_REPO>/main/gxo-groupwise-close-order-claiming.user.js
+// @homepageURL  https://github.com/Lex-Dorosh/NodeRED
+// @supportURL   https://github.com/Lex-Dorosh/NodeRED/issues
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/gxo-groupwise-close-order-claiming.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/gxo-groupwise-close-order-claiming.user.js
 // ==/UserScript==
 
 (function () {
