@@ -1,15 +1,15 @@
 // ==UserScript==
-// @name         Groupwise Mini VOID Remove (Samsung)
+// @name         Groupwise Claim RMA (Samsung)
 // @namespace    https://groupwise.cerepair.nl/
 // @version      0.1.1
-// @description  Samsung-only: robust Claim/Repair navigation -> Cancel Reason = first option (---------) -> Opslaan -> Repair
+// @description  Samsung-only: robust Claim/Repair navigation -> Exchange reason = G (Commerciele redenen) -> Opslaan -> Repair
 // @author       Alex + OpenClaw Copilot
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-mini-void-remove.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-mini-void-remove.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-claim-rma-mini.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-claim-rma-mini.user.js
 // ==/UserScript==
 
 (function () {
@@ -17,13 +17,13 @@
 
   const CFG = {
     debug: true,
-    btnId: 'tm-mini-void-remove-btn',
-    btnText: 'MINI VOID REMOVE',
+    btnId: 'tm-claim-rma-btn',
+    btnText: 'CLAIM RMA',
     retryMs: 220,
     timeoutMs: 12000,
   };
 
-  const log = (...a) => CFG.debug && console.log('[MINI-VOID]', ...a);
+  const log = (...a) => CFG.debug && console.log('[CLAIM-RMA]', ...a);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function allDocs() {
@@ -100,7 +100,7 @@
   }
 
   function onClaimPage() {
-    return /name=claim/i.test(location.href) || !!q('#cancelreason');
+    return /name=claim/i.test(location.href) || !!q('#reason_of_exchange');
   }
 
   function onRepairPage() {
@@ -131,22 +131,22 @@
         }
       }
 
-      const cancelSel = await waitFor(() => q('#cancelreason'));
-      if (!cancelSel) {
-        alert('Cancel Reason veld (#cancelreason) niet gevonden.');
+      const sel = await waitFor(() => q('#reason_of_exchange'));
+      if (!sel) {
+        alert('Exchange reason veld (#reason_of_exchange) niet gevonden.');
         return;
       }
 
-      const firstOpt = cancelSel.querySelector('option[value=""]') || cancelSel.options[0];
-      if (!firstOpt) {
-        alert('Geen optie gevonden in Cancel Reason.');
+      const optionG = sel.querySelector('option[value="G"]') || Array.from(sel.options || []).find(o => /G:\s*Commerciele redenen/i.test(String(o.textContent || '')));
+      if (!optionG) {
+        alert('Optie G: Commerciele redenen niet gevonden.');
         return;
       }
 
-      cancelSel.value = firstOpt.value;
-      firstOpt.selected = true;
-      triggerChange(cancelSel);
-      log('Cancel Reason ->', firstOpt.value || '(empty/---------)');
+      sel.value = optionG.value;
+      optionG.selected = true;
+      triggerChange(sel);
+      log('Exchange reason ->', optionG.value, optionG.textContent || '');
 
       const saveBtn = await waitFor(() => q('#opslaan,button#opslaan,input#opslaan'));
       if (!saveBtn) {
@@ -180,7 +180,6 @@
 
     const anchor = q('#comments') || q('#btn_iriscodes') || q('h3');
     if (!anchor) return;
-
     if (q('#' + CFG.btnId)) return;
 
     const d = anchor.ownerDocument || document;
@@ -188,7 +187,7 @@
     btn.id = CFG.btnId;
     btn.type = 'button';
     btn.textContent = CFG.btnText;
-    btn.style.cssText = 'margin-left:8px;padding:2px 8px;height:22px;border:1px solid #8b6f47;background:#eadbc6;color:#4a3722;border-radius:4px;cursor:pointer;font:700 11px/1 Arial,sans-serif;vertical-align:middle;';
+    btn.style.cssText = 'margin-left:8px;padding:2px 8px;height:22px;border:1px solid #6e8b5b;background:#dcebd3;color:#234019;border-radius:4px;cursor:pointer;font:700 11px/1 Arial,sans-serif;vertical-align:middle;';
     btn.addEventListener('click', () => runFlow(btn));
 
     anchor.insertAdjacentElement('afterend', btn);
