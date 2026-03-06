@@ -10,8 +10,8 @@
 // @noframes     false
 // @homepageURL  https://github.com/YOUR_ORG/YOUR_REPO
 // @supportURL   https://github.com/YOUR_ORG/YOUR_REPO/issues
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/projects/groupwise-iris-rma-mini/release/groupwise-iris-set-rma.clean.user.js
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/projects/groupwise-iris-rma-mini/release/groupwise-iris-set-rma.clean.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-iris-set-rma.clean.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-iris-set-rma.clean.user.js
 // ==/UserScript==
 
 (function () {
