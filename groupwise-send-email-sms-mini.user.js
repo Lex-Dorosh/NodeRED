@@ -3,7 +3,7 @@
 // @namespace    https://groupwise.cerepair.nl/
 // @version      0.2.1
 // @description  Mini script for Credit flow points 12/13: SEND_EMAIL (Credit Akkoord) and SEND_SMS (Melding reactie op Email)
-// @author       Alex + OpenClaw Copilot
+// @author       Alex
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle
 // @grant        none
