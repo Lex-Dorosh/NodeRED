@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         Groupwise Send Email + SMS (Mini)
 // @namespace    https://groupwise.cerepair.nl/
-// @version      0.2.1
+// @version      0.2.1-clean
 // @description  Mini script for Credit flow points 12/13: SEND_EMAIL (Credit Akkoord) and SEND_SMS (Melding reactie op Email)
 // @author       Alex
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.clean.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.clean.user.js
 // ==/UserScript==
 
 (function () {
@@ -30,7 +30,7 @@
   const RES_KEY = 'gw_email_sms_mini_result_v1';
   const NO06_PHRASE = 'mobiel nummer is niet valide';
 
-  const log = (...a) => CFG.debug && console.log('[GW-EMAIL-SMS-MINI]', ...a);
+  const log = () => {};
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const popupRefs = [];
 
@@ -160,8 +160,12 @@
   function selectByNeedle(selectEl, needle) {
     if (!selectEl) return false;
     const n = String(needle || '').trim().toLowerCase();
-    const opt = [...selectEl.options].find((o) => String(o.textContent || '').toLowerCase().includes(n));
+    const opts = [...selectEl.options];
+
+    // Strict mode: exact match only
+    const opt = opts.find((o) => String(o.textContent || '').trim().toLowerCase() === n);
     if (!opt) return false;
+
     selectEl.value = opt.value;
     selectEl.dispatchEvent(new Event('change', { bubbles: true }));
     return true;
@@ -260,13 +264,11 @@
       ta.value = 'Geen 06';
       try { ta.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
 
-      // WVB-style preferred path
       try {
         const w = d.defaultView || window;
         if (typeof w.addcomment === 'function') { w.addcomment(); return true; }
       } catch {}
 
-      // Fallback add button
       const addBtn = d.querySelector('#btn_addcomment') || findButtonByTextInDoc(d, 'add');
       if (addBtn) {
         try { addBtn.click(); return true; } catch {}
@@ -274,12 +276,10 @@
       return false;
     }
 
-    // current page + all frames
     for (const d of allDocs()) {
       if (applyInDoc(d)) return true;
     }
 
-    // if called from popup, try opener docs/frames
     try {
       if (window.opener && window.opener.document) {
         const od = window.opener.document;
@@ -316,7 +316,6 @@
     const req = markRequest('email');
     mailBtn.click();
 
-    // fallback: sometimes compose is inline and available in same page
     if (isEmailComposeContext()) {
       const d = document;
       const tpl = d.querySelector('#naam,select#naam,select[name="naam"]');
@@ -363,7 +362,6 @@
     let capturedNo06 = false;
     const patched = [];
 
-    // WVB-style: patch alert only around click
     for (const d of allDocs()) {
       try {
         const w = d.defaultView;
@@ -394,7 +392,6 @@
       return true;
     }
 
-    // fallback: sometimes compose is inline and available in same page
     if (isSmsComposeContext()) {
       const d = document;
       const tpl = d.querySelector('#lst_tekst,select#lst_tekst,select[name="lst_tekst"]');
@@ -417,7 +414,6 @@
 
     const res = await waitForResult(req.id, CFG.smsWaitMs);
     if (!res) {
-      // Fallback: avoid hard-fail popup; leave diagnostic in console
       log('SEND_SMS timeout: no popup result received');
       return false;
     }
@@ -471,7 +467,6 @@
 
       if (stage === 'waiting_ready') {
         const tr = getTries();
-        // wait until body appears (if available), otherwise allow delayed send after few rounds
         const bodyReady = body ? !!(body.value || '').trim() : (tr >= 2);
         if (bodyReady) {
           setStage('sending');
@@ -531,7 +526,6 @@
         return true;
       }
 
-      // If template already produced text, just send once
       if ((txt.value || '').trim()) {
         setStage('sending');
 
@@ -584,7 +578,6 @@
           completeRequest(req.id, false, 'sms text not generated after template select');
           return true;
         }
-        // bump counter on each pass to avoid infinite loop
         incTry();
         log('SMS waiting text...', { reqId: req.id, tries: getTries(), textLen: (txt.value || '').trim().length });
         return true;
@@ -651,7 +644,6 @@
     if (window.top !== window) return;
     installPopupTracker();
 
-    // Popup/dialog auto-handlers (WVB-like opener flow)
     setTimeout(() => { processEmailComposeIfRequested(); }, 200);
     setTimeout(() => { processSmsComposeIfRequested(); }, 300);
 
