@@ -1,15 +1,15 @@
 // ==UserScript==
-// @name         Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status)
+// @name         Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status) [BETA]
 // @namespace    https://groupwise.cerepair.nl/
-// @version      4.13
+// @version      4.13-beta
 // @description  GG PUR helper: Samsung gets AUTO 42,50 & AUTO 63,80 full flow (Financials+Bereken+Claim VOID1+Mail direct+SMS+Status). Other brands: Fill-only buttons incl. Fill 100,50. Language detection -> SMS template by owner language.
 // @author       you
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-end
 // @grant        none
 //
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/gxo-pur-helper.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/gxo-pur-helper.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status)-4.13.beta.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status)-4.13.beta.user.js
 // ==/UserScript==
 
 (function () {

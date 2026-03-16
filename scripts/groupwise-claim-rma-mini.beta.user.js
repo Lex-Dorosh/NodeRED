@@ -1,15 +1,15 @@
 // ==UserScript==
-// @name         Groupwise Claim RMA (Samsung)
+// @name         Groupwise Claim RMA (Samsung) [BETA]
 // @namespace    https://groupwise.cerepair.nl/
-// @version      0.1.1
+// @version      0.1.1-beta
 // @description  Samsung-only: robust Claim/Repair navigation -> Exchange reason = G (Commerciele redenen) -> Opslaan -> Repair
 // @author       Alex + OpenClaw Copilot
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-claim-rma-mini.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-claim-rma-mini.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-claim-rma-mini.beta.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-claim-rma-mini.beta.user.js
 // ==/UserScript==
 
 (function () {

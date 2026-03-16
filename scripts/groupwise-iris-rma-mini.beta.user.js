@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         GROUPWISE IRIS RMA Mini Autofill
+// @name         GROUPWISE IRIS RMA Mini Autofill [BETA]
 // @namespace    https://groupwise.cerepair.nl/
-// @version      0.1.2
+// @version      0.1.2-beta
 // @description  Adds "IRIS SET RMA" button near IRIS controls and fills 5 IRIS selects (last field uses penultimate option).
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle

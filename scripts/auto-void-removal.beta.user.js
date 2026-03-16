@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Groupwise/GSPN - AUTO VOID REMOVAL
+// @name         Groupwise/GSPN - AUTO VOID REMOVAL [BETA]
 // @namespace    froopt/groupwise
-// @version      0.1.4
+// @version      0.1.4-beta
 // @description  Semi-automatic VOID removal flow: Groupwise -> GSPN
 // @match        https://groupwise.cerepair.nl/*
 // @match        https://biz1.samsungcsportal.com/*

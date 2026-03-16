@@ -1,15 +1,15 @@
 // ==UserScript==
-// @name         Groupwise Mini VOID Remove (Samsung)
+// @name         Groupwise Mini VOID Remove (Samsung) [BETA]
 // @namespace    https://groupwise.cerepair.nl/
-// @version      0.1.1
+// @version      0.1.1-beta
 // @description  Samsung-only: robust Claim/Repair navigation -> Cancel Reason = first option (---------) -> Opslaan -> Repair
 // @author       Alex + OpenClaw Copilot
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-mini-void-remove.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-mini-void-remove.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-mini-void-remove.beta.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-mini-void-remove.beta.user.js
 // ==/UserScript==
 
 (function () {

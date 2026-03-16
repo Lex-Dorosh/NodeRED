@@ -1,15 +1,15 @@
 // ==UserScript==
-// @name         Groupwise Send Email + SMS (Mini)
+// @name         Groupwise Send Email + SMS (Mini) [BETA]
 // @namespace    https://groupwise.cerepair.nl/
-// @version      0.2.3
+// @version      0.2.3-beta
 // @description  Mini script for Credit flow points 12/13: SEND_EMAIL (Credit Akkoord) and SEND_SMS (Melding reactie op Email)
 // @author       Alex + OpenClaw Copilot
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.beta.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.beta.user.js
 // ==/UserScript==
 
 (function () {

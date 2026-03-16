@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Groupwise - Credit Batch Processor
+// @name         Groupwise - Credit Batch Processor [BETA]
 // @namespace    froopt/groupwise
-// @version      0.2.0
+// @version      0.2.0-beta
 // @description  Batch process orders from pasted pairs: serviceNo + item_id (Claim save + finalize flow)
 // @match        https://groupwise.cerepair.nl/*
 // @grant        GM_setValue

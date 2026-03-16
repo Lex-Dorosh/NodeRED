@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Groupwise - Copy TB6 line
+// @name         Groupwise - Copy TB6 line [BETA]
 // @namespace    froopt/groupwise
-// @version      0.1.5
+// @version      0.1.5-beta
 // @description  Adds "copy TB6" button near Remarks and copies order fields as one tab-separated line for Excel
 // @match        https://groupwise.cerepair.nl/*
 // @grant        GM_setClipboard
