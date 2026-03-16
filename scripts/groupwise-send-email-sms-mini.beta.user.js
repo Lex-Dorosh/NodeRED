@@ -339,6 +339,11 @@
       }) || null;
   }
 
+  function isSamsungOrder() {
+    const party = String(getOrderPartyLabel() || '').toLowerCase();
+    return party.includes('samsung'); // includes Samsung WS
+  }
+
   function chooseEmailButtonByParty() {
     const party = String(getOrderPartyLabel() || '').toLowerCase();
     const isSamsungFlow = party.includes('samsung'); // includes "Samsung WS"
@@ -660,6 +665,11 @@
   }
 
   async function sendBoth(btn) {
+    if (!isSamsungOrder()) {
+      alert('EMAIL+SMS works only for Samsung orders');
+      return;
+    }
+
     btn.disabled = true;
     const old = btn.textContent;
     btn.textContent = 'RUN...';
@@ -690,6 +700,7 @@
   function mountButtons() {
     const anchor = q(CFG.hostSelector);
     if (!anchor) return;
+    if (!isSamsungOrder()) return;
     const d = anchor.ownerDocument || document;
 
     if (d.getElementById('tm-send-email-sms-both')) return;

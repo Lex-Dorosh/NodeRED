@@ -216,7 +216,20 @@
     setTimeout(() => toast.remove(), 2200);
   }
 
+  function isSamsungOrder() {
+    for (const d of getAllAccessibleDocs()) {
+      const links = Array.from(d.querySelectorAll('a[href*="neworder3.aspx"]'));
+      if (links.some(a => (a.textContent || '').toLowerCase().includes('samsung'))) return true;
+    }
+    return false;
+  }
+
   async function copyLine() {
+    if (!isSamsungOrder()) {
+      showToast('⛔ Only Samsung orders', 'warn');
+      return;
+    }
+
     const fields = collectData();
     const missing = [];
 
