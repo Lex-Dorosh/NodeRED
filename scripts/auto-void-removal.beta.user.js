@@ -9,6 +9,8 @@
 // @grant        GM_getValue
 // @grant        GM_setClipboard
 // @run-at       document-idle
+// @downloadURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/auto-void-removal.beta.user.js
+// @updateURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/auto-void-removal.beta.user.js
 // ==/UserScript==
 
 (function () {

@@ -8,8 +8,8 @@
 // @run-at       document-end
 // @grant        none
 //
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status)-4.13.beta.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status)-4.13.beta.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status)-4.13.beta.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/Werkvoorbereiding GG PUR helper (flow per stap, Claim+Opslaan, Mail+SMS+Status)-4.13.beta.user.js
 // ==/UserScript==
 
 (function () {

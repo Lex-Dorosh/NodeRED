@@ -8,8 +8,8 @@
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.beta.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-send-email-sms-mini.beta.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/groupwise-send-email-sms-mini.beta.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/groupwise-send-email-sms-mini.beta.user.js
 // ==/UserScript==
 
 (function () {

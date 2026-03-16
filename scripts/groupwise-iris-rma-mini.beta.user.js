@@ -7,6 +7,8 @@
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
+// @downloadURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/groupwise-iris-rma-mini.beta.user.js
+// @updateURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/groupwise-iris-rma-mini.beta.user.js
 // ==/UserScript==
 
 (function () {

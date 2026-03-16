@@ -6,6 +6,8 @@
 // @match        https://groupwise.cerepair.nl/*
 // @grant        GM_setClipboard
 // @run-at       document-idle
+// @downloadURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/groupwise-copy-tb6.beta.user.js
+// @updateURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/groupwise-copy-tb6.beta.user.js
 // ==/UserScript==
 
 (function () {

@@ -8,8 +8,8 @@
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-mini-void-remove.beta.user.js
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-mini-void-remove.beta.user.js
+// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/groupwise-mini-void-remove.beta.user.js
+// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/gxo-beta/scripts/groupwise-mini-void-remove.beta.user.js
 // ==/UserScript==
 
 (function () {
