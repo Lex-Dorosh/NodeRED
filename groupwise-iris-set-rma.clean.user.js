@@ -1,216 +1,302 @@
 // ==UserScript==
-// @name         Groupwise IRIS SET RMA (Samsung)
+// @name         GROUPWISE IRIS RMA Mini Autofill [BETA]
 // @namespace    https://groupwise.cerepair.nl/
-// @version      1.0.0
-// @description  Samsung-only: adds "IRIS SET RMA" and fills IRIS codes (5th field = penultimate option).
-// @author       Alex + OpenClaw Copilot
+// @version      0.1.3-beta
+// @description  Adds "IRIS SET RMA" button and fills IRIS codes (Defect=N, Repair=Z, others=first valid option).
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle
 // @grant        none
 // @noframes     false
-// @homepageURL  https://github.com/YOUR_ORG/YOUR_REPO
-// @supportURL   https://github.com/YOUR_ORG/YOUR_REPO/issues
-// @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-iris-set-rma.clean.user.js
-// @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-iris-set-rma.clean.user.js
+// @downloadURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-iris-set-rma.clean.user.js
+// @updateURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-iris-set-rma.clean.user.js
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const C = {
-    id: 'tm-iris-rma-btn',
-    text: 'IRIS SET RMA',
-    delay: 120,
-    openTimeout: 15000,
-    poll: 150,
-    remount: 1000,
-    fields: ['lst_condition', 'lst_symptom', 'lst_section', 'lst_defect', 'lst_repair']
+  const CONFIG = {
+    debug: true,
+    logPrefix: '[IRIS-RMA v0.1.2]',
+    buttonId: 'tm-iris-rma-btn',
+    buttonText: 'IRIS SET RMA',
+    fillDelayMs: 120,
+    openTimeoutMs: 15000,
+    waitIntervalMs: 150,
+    mountRetryEveryMs: 1000,
+    targetSelectIds: ['lst_condition', 'lst_symptom', 'lst_section', 'lst_defect', 'lst_repair']
   };
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const log = (...args) => CONFIG.debug && console.log(CONFIG.logPrefix, ...args);
+  const warn = (...args) => console.warn(CONFIG.logPrefix, ...args);
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-  function docs(root = window.top) {
+  function getAccessibleDocs(rootWin = window.top) {
     const out = [];
     const seen = new WeakSet();
-    const walk = (w) => {
+
+    const visit = (w) => {
       let d;
       try { d = w.document; } catch { return; }
       if (!d || seen.has(d)) return;
       seen.add(d);
       out.push({ win: w, doc: d });
-      let n = 0;
-      try { n = w.frames.length; } catch { n = 0; }
-      for (let i = 0; i < n; i++) {
-        try { walk(w.frames[i]); } catch {}
+
+      let len = 0;
+      try { len = w.frames.length; } catch { len = 0; }
+      for (let i = 0; i < len; i++) {
+        try { visit(w.frames[i]); } catch {}
       }
     };
-    walk(root);
+
+    visit(rootWin);
     return out;
   }
 
-  function byIdDeep(id) {
-    for (const { win, doc } of docs()) {
+  function findByIdDeep(id) {
+    for (const { win, doc } of getAccessibleDocs()) {
       const el = doc.getElementById(id);
       if (el) return { win, doc, el };
     }
     return null;
   }
 
-  async function waitFor(fn, timeout = 10000, step = 200) {
+  async function waitFor(checkFn, timeoutMs = 10000, intervalMs = 200) {
     const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
+    while (Date.now() - t0 < timeoutMs) {
       try {
-        const v = fn();
-        if (v) return v;
+        const value = checkFn();
+        if (value) return value;
       } catch {}
-      await sleep(step);
+      await sleep(intervalMs);
     }
     return null;
   }
 
-  function visible(el) {
+  function isElementVisible(el) {
     if (!el) return false;
-    const d = el.ownerDocument || document;
-    const w = d.defaultView || window;
-    const cs = w.getComputedStyle(el);
+    const doc = el.ownerDocument || document;
+    const win = doc.defaultView || window;
+    const cs = win.getComputedStyle(el);
     return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
   }
 
-  function validOptions(sel) {
-    return Array.from(sel.options || []).filter((o) => {
-      const v = String(o.value || '').trim();
-      const t = String(o.textContent || '').trim();
-      return !!v && !/^[-\s]+$/.test(t);
+  function getValidOptions(selectEl) {
+    const options = Array.from(selectEl.options || []);
+    return options.filter(opt => {
+      const value = String(opt.value || '').trim();
+      const text = String(opt.textContent || '').trim();
+      if (!value) return false;
+      if (/^[-\s]+$/.test(text)) return false;
+      return true;
     });
   }
 
-  function first(sel) {
-    const v = validOptions(sel);
-    return v[0] || null;
+  function getFirstValidOption(selectEl) {
+    const valid = getValidOptions(selectEl);
+    return valid[0] || null;
   }
 
-  function penultimate(sel) {
-    const v = validOptions(sel);
-    if (!v.length) return null;
-    return v.length === 1 ? v[0] : v[v.length - 2];
+  function getOptionByValue(selectEl, wantedValue) {
+    const valid = getValidOptions(selectEl);
+    return valid.find(opt => String(opt.value) === String(wantedValue)) || null;
   }
 
-  function setValue(sel, value) {
-    sel.value = value;
-    sel.dispatchEvent(new Event('input', { bubbles: true }));
-    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  function getPenultimateValidOption(selectEl) {
+    const valid = getValidOptions(selectEl);
+    if (!valid.length) return null;
+    if (valid.length === 1) return valid[0];
+    return valid[valid.length - 2];
   }
 
-  function toast(msg, ok = true, d = document) {
-    const n = d.createElement('div');
-    n.textContent = msg;
-    n.style.cssText = `position:fixed;right:14px;bottom:14px;z-index:999999;max-width:420px;padding:10px 12px;border-radius:10px;color:#fff;font:12px/1.3 system-ui;background:${ok ? 'rgba(22,163,74,.95)' : 'rgba(220,38,38,.95)'};box-shadow:0 8px 20px rgba(0,0,0,.35);`;
-    (d.body || d.documentElement).appendChild(n);
-    setTimeout(() => n.remove(), 3000);
+  function setSelectValue(selectEl, value) {
+    selectEl.value = value;
+    selectEl.dispatchEvent(new Event('input', { bubbles: true }));
+    selectEl.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  function isSamsung(doc) {
+  function showToast(message, ok = true, targetDoc = document) {
+    const d = targetDoc.createElement('div');
+    d.textContent = message;
+    d.style.cssText = `
+      position: fixed;
+      right: 14px;
+      bottom: 14px;
+      z-index: 999999;
+      max-width: 420px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      color: #fff;
+      font: 12px/1.3 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: ${ok ? 'rgba(22,163,74,.95)' : 'rgba(220,38,38,.95)'};
+      box-shadow: 0 8px 20px rgba(0,0,0,.35);
+    `;
+    (targetDoc.body || targetDoc.documentElement).appendChild(d);
+    setTimeout(() => d.remove(), 3500);
+  }
+
+  async function ensureIrisPanelOpen() {
+    const existing = findByIdDeep('tbl_iris');
+    if (existing && isElementVisible(existing.el)) {
+      log('IRIS panel already open');
+      return true;
+    }
+
+    const btnCtx = findByIdDeep('btn_iriscodes');
+    if (!btnCtx?.el) {
+      warn('btn_iriscodes not found');
+      return false;
+    }
+
+    try { btnCtx.el.click(); } catch {}
+    try { if (typeof btnCtx.win.showiris === 'function') btnCtx.win.showiris(); } catch {}
+
+    const opened = await waitFor(() => {
+      const irisCtx = findByIdDeep('tbl_iris');
+      if (!irisCtx?.el) return null;
+      return isElementVisible(irisCtx.el) ? irisCtx : null;
+    }, CONFIG.openTimeoutMs, CONFIG.waitIntervalMs);
+
+    if (!opened) {
+      warn('IRIS panel did not open in time');
+      return false;
+    }
+
+    log('IRIS panel opened');
+    return true;
+  }
+
+  async function fillAllIrisSelectsWithFirstOption() {
+    const report = [];
+
+    for (const selectId of CONFIG.targetSelectIds) {
+      const selCtx = await waitFor(() => {
+        const ctx = findByIdDeep(selectId);
+        if (!ctx?.el || ctx.el.tagName !== 'SELECT') return null;
+        return ctx;
+      }, 8000, CONFIG.waitIntervalMs);
+
+      if (!selCtx?.el) {
+        report.push({ id: selectId, ok: false, reason: 'SELECT not found' });
+        warn(`SELECT not found: #${selectId}`);
+        continue;
+      }
+
+      let opt = null;
+      if (selectId === 'lst_defect') {
+        opt = getOptionByValue(selCtx.el, 'N');
+      } else if (selectId === 'lst_repair') {
+        opt = getOptionByValue(selCtx.el, 'Z');
+      } else {
+        opt = getFirstValidOption(selCtx.el);
+      }
+
+      if (!opt) {
+        report.push({ id: selectId, ok: false, reason: 'No valid options' });
+        warn(`No valid option for #${selectId}`);
+        continue;
+      }
+
+      setSelectValue(selCtx.el, opt.value);
+      report.push({ id: selectId, ok: true, value: opt.value, text: (opt.textContent || '').trim() });
+      log(`Filled #${selectId} -> value="${opt.value}" text="${(opt.textContent || '').trim()}"${selectId === 'lst_repair' ? ' (penultimate)' : ''}`);
+
+      await sleep(CONFIG.fillDelayMs);
+    }
+
+    return report;
+  }
+
+  function isSamsungOrder(hostDoc) {
     try {
-      return Array.from(doc.querySelectorAll('legend')).some((l) => /\bsamsung\b/i.test(String(l.textContent || '')));
+      const legends = Array.from(hostDoc.querySelectorAll('legend'));
+      return legends.some(l => /\bsamsung\b/i.test(String(l.textContent || '')));
     } catch {
       return false;
     }
   }
 
-  async function ensureIrisOpen() {
-    const t = byIdDeep('tbl_iris');
-    if (t && visible(t.el)) return true;
+  function createInlineButton(hostDoc, hostEl) {
+    if (!hostDoc || !hostEl) return null;
+    if (hostDoc.getElementById(CONFIG.buttonId)) return hostDoc.getElementById(CONFIG.buttonId);
 
-    const b = byIdDeep('btn_iriscodes');
-    if (!b?.el) return false;
+    const btn = hostDoc.createElement('button');
+    btn.id = CONFIG.buttonId;
+    btn.type = 'button';
+    btn.textContent = CONFIG.buttonText;
+    btn.style.cssText = `
+      margin-left: 8px;
+      padding: 2px 8px;
+      height: 22px;
+      border: 1px solid #7aa2b8;
+      background: #cfe4ef;
+      color: #1f3b4d;
+      border-radius: 4px;
+      cursor: pointer;
+      font: 700 11px/1 Arial, sans-serif;
+      vertical-align: middle;
+    `;
 
-    try { b.el.click(); } catch {}
-    try { if (typeof b.win.showiris === 'function') b.win.showiris(); } catch {}
-
-    const ok = await waitFor(() => {
-      const x = byIdDeep('tbl_iris');
-      return x?.el && visible(x.el) ? x : null;
-    }, C.openTimeout, C.poll);
-
-    return !!ok;
-  }
-
-  async function fillAll() {
-    const report = [];
-    for (const id of C.fields) {
-      const ctx = await waitFor(() => {
-        const x = byIdDeep(id);
-        return x?.el && x.el.tagName === 'SELECT' ? x : null;
-      }, 8000, C.poll);
-
-      if (!ctx?.el) {
-        report.push({ id, ok: false });
-        continue;
-      }
-
-      const opt = id === 'lst_repair' ? penultimate(ctx.el) : first(ctx.el);
-      if (!opt) {
-        report.push({ id, ok: false });
-        continue;
-      }
-
-      setValue(ctx.el, opt.value);
-      report.push({ id, ok: true, value: opt.value });
-      await sleep(C.delay);
-    }
-    return report;
-  }
-
-  function mountButton(doc, anchor) {
-    if (doc.getElementById(C.id)) return;
-
-    const b = doc.createElement('button');
-    b.id = C.id;
-    b.type = 'button';
-    b.textContent = C.text;
-    b.style.cssText = 'margin-left:8px;padding:2px 8px;height:22px;border:1px solid #7aa2b8;background:#cfe4ef;color:#1f3b4d;border-radius:4px;cursor:pointer;font:700 11px/1 Arial,sans-serif;vertical-align:middle;';
-
-    b.addEventListener('click', async () => {
-      b.disabled = true;
-      const txt = b.textContent;
-      b.textContent = 'RUN...';
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      const originalText = btn.textContent;
+      btn.textContent = 'RUN...';
       try {
-        const opened = await ensureIrisOpen();
+        log('IRIS RMA started');
+        const opened = await ensureIrisPanelOpen();
         if (!opened) {
-          toast('IRIS panel not found/opened', false, doc);
+          showToast('IRIS panel not found/opened', false, hostDoc);
           return;
         }
-        const r = await fillAll();
-        const ok = r.filter((x) => x.ok).length;
-        toast(ok === 5 ? 'IRIS filled: 5/5' : `IRIS partial: ${ok}/5`, ok === 5, doc);
+
+        const results = await fillAllIrisSelectsWithFirstOption();
+        const okCount = results.filter(r => r.ok).length;
+        const failCount = results.length - okCount;
+
+        if (failCount === 0) showToast(`IRIS filled: ${okCount}/5`, true, hostDoc);
+        else showToast(`IRIS partial: ${okCount}/5 (check console)`, false, hostDoc);
+
+        log('IRIS RMA finished', results);
+      } catch (err) {
+        warn('IRIS RMA failed', err);
+        showToast(`IRIS RMA error: ${String(err?.message || err)}`, false, hostDoc);
       } finally {
-        b.disabled = false;
-        b.textContent = txt;
+        btn.disabled = false;
+        btn.textContent = originalText;
       }
     });
 
-    anchor.insertAdjacentElement('afterend', b);
+    hostEl.insertAdjacentElement('afterend', btn);
+    log('IRIS RMA button mounted near btn_iriscodes');
+    return btn;
   }
 
-  function remount() {
-    const ctx = byIdDeep('btn_iriscodes');
-    if (!ctx?.el || !ctx.doc) return;
+  function tryMountButton() {
+    const irisBtnCtx = findByIdDeep('btn_iriscodes');
+    if (!irisBtnCtx?.el || !irisBtnCtx.doc) return false;
 
-    const show = isSamsung(ctx.doc);
-    const ex = ctx.doc.getElementById(C.id);
+    const allowed = isSamsungOrder(irisBtnCtx.doc);
+    const existing = irisBtnCtx.doc.getElementById(CONFIG.buttonId);
 
-    if (!show) {
-      if (ex) ex.remove();
-      return;
+    if (!allowed) {
+      if (existing) existing.remove();
+      return false;
     }
 
-    mountButton(ctx.doc, ctx.el);
+    createInlineButton(irisBtnCtx.doc, irisBtnCtx.el);
+    return true;
   }
 
-  (async () => {
+  async function boot() {
     if (!/groupwise\.cerepair\.nl$/i.test(location.hostname)) return;
+
     await waitFor(() => document.body, 15000, 100);
-    remount();
-    setInterval(() => { try { remount(); } catch {} }, C.remount);
-  })();
+
+    tryMountButton();
+
+    setInterval(() => {
+      try { tryMountButton(); } catch {}
+    }, CONFIG.mountRetryEveryMs);
+  }
+
+  boot().catch(err => warn('Boot error', err));
 })();
