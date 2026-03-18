@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         GROUPWISE IRIS RMA Mini Autofill [BETA]
 // @namespace    https://groupwise.cerepair.nl/
-// @version      0.1.3-beta
+// @version      0.1.3
 // @description  Adds "IRIS SET RMA" button and fills IRIS codes (Defect=N, Repair=Z, others=first valid option).
 // @match        https://groupwise.cerepair.nl/*
 // @run-at       document-idle
 // @grant        none
-// @noframes     false
 // @downloadURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-iris-set-rma.clean.user.js
 // @updateURL https://raw.githubusercontent.com/Lex-Dorosh/NodeRED/main/groupwise-iris-set-rma.clean.user.js
 // ==/UserScript==
